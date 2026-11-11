@@ -230,3 +230,128 @@ def test_provider_zdr_hints_metadata(isolated_hermes_env):
     assert isinstance(rewritten["messages"], list)
     assert len(rewritten["messages"]) == 1
     assert rewritten["messages"][0]["content"] == "Safe query"
+
+
+def test_transform_llm_request_real_hermes_double_bar_and_anthropic_system(isolated_hermes_env):
+    """
+    Regression test: Real Hermes system prompts wrap MEMORY and USER PROFILE headers
+    between TWO ══════ divider bars and end before 'Active Hermes profile:' (no trailing bar).
+    Also verifies Anthropic 'system' and Codex 'instructions' top-level fields are stripped.
+    """
+    if IncognitoEngine is None:
+        pytest.skip("IncognitoEngine not yet importable")
+
+    tmp_path = isolated_hermes_env["home"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+    sess_id = "sess-real-double-bar"
+    eng.enable_session(sess_id, mode="strict")
+
+    real_hermes_prompt = (
+        "Only proceed without loading a skill if genuinely none are relevant to the task.\n\n"
+        "══════════════════════════════════════════════\n"
+        "MEMORY (your personal notes) [99% — 3,984/4,000 chars]\n"
+        "══════════════════════════════════════════════\n"
+        "Workspace scratch: C:\\Temp\n"
+        "§\n"
+        "Secret favorite color note: azul cobalto\n\n"
+        "══════════════════════════════════════════════\n"
+        "USER PROFILE (who the user is) [96% — 2,897/3,000 chars]\n"
+        "══════════════════════════════════════════════\n"
+        "User's name: Nicolás.\n"
+        "§\n"
+        "Location: Cali.\n\n"
+        "Active Hermes profile: default.\n\n"
+        "Conversation started: Wednesday, November 11, 2026\n\n"
+        "# Hermes runtime environment\n\nHost: Windows (11)"
+    )
+
+    # 1. OpenAI/Gemini messages format
+    req_chat = {
+        "messages": [
+            {"role": "system", "content": real_hermes_prompt},
+            {"role": "user", "content": "Cual es mi color favorito?"},
+        ]
+    }
+    res_chat = eng.transform_llm_request(sess_id, req_chat)
+    assert res_chat is not None
+    cleaned = res_chat["request"]["messages"][0]["content"]
+    assert "MEMORY (your personal notes)" not in cleaned
+    assert "USER PROFILE (who the user is)" not in cleaned
+    assert "azul cobalto" not in cleaned
+    assert "User's name: Nicolás." not in cleaned
+    assert "Active Hermes profile: default." in cleaned
+    assert "# Hermes runtime environment" in cleaned
+
+    # 2. Anthropic top-level system + Codex instructions format
+    req_anth = {
+        "system": [{"type": "text", "text": real_hermes_prompt}],
+        "instructions": real_hermes_prompt,
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    res_anth = eng.transform_llm_request(sess_id, req_anth)
+    assert res_anth is not None
+    assert "azul cobalto" not in res_anth["request"]["system"][0]["text"]
+    assert "azul cobalto" not in res_anth["request"]["instructions"]
+
+
+def test_cross_session_search_scrubbing_and_direct_read_block(isolated_hermes_env):
+    """
+    Regression test: Normal non-incognito sessions cannot read or discover active
+    incognito sessions via session_search or deferred tool_call.
+    """
+    if IncognitoEngine is None:
+        pytest.skip("IncognitoEngine not yet importable")
+
+    import json
+    tmp_path = isolated_hermes_env["home"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+
+    incog_sid = "local-incognito-secret-chat"
+    normal_sid = "local-normal-public-chat"
+    eng.enable_session(incog_sid, mode="strict")
+
+    # Direct read of incognito session from a normal session is blocked
+    guard_direct = eng.evaluate_tool_guard(normal_sid, "session_search", {"session_id": incog_sid})
+    assert guard_direct is not None and guard_direct["action"] == "block"
+
+    # Wrapped deferred tool_call targeting incognito session is also blocked
+    guard_wrapped = eng.evaluate_tool_guard(
+        normal_sid,
+        "tool_call",
+        {"calls": [{"name": "session_search", "arguments": {"session_id": incog_sid}}]},
+    )
+    assert guard_wrapped is not None and guard_wrapped["action"] == "block"
+
+    # Discovery search from normal session scrubs incognito session hits from JSON result
+    raw_search_result = json.dumps({
+        "success": True,
+        "mode": "discover",
+        "query": "color favorito",
+        "count": 2,
+        "results": [
+            {"session_id": incog_sid, "title": "Recordar color favorito stiven", "snippet": "stiven"},
+            {"session_id": "local-older-public", "title": "Tema publico", "snippet": "hola"},
+        ],
+    })
+    scrubbed_str = eng.scrub_tool_result(normal_sid, "session_search", {"query": "color favorito"}, raw_search_result)
+    assert scrubbed_str is not None
+    scrubbed = json.loads(scrubbed_str)
+    assert scrubbed["count"] == 1
+    assert len(scrubbed["results"]) == 1
+    assert scrubbed["results"][0]["session_id"] == "local-older-public"
+    assert "stiven" not in scrubbed_str
+
+    # Raw execute_code / terminal bypass attempting to open state.db directly is blocked while incognito is active
+    guard_exec = eng.evaluate_tool_guard(
+        normal_sid,
+        "execute_code",
+        {"code": 'import sqlite3\nconn = sqlite3.connect("C:/Users/nicol/AppData/Local/hermes/state.db")'},
+    )
+    assert guard_exec is not None and guard_exec["action"] == "block"
+
+    # Raw output line scrubbing for execute_code / terminal as defense-in-depth
+    raw_exec_out = f"109547 {incog_sid} Mi color favorito es forsaken\n109549 {normal_sid} Hola\n"
+    scrubbed_exec = eng.scrub_tool_result(normal_sid, "execute_code", {}, raw_exec_out)
+    assert scrubbed_exec is not None
+    assert "forsaken" not in scrubbed_exec
+    assert "Hola" in scrubbed_exec

@@ -534,7 +534,34 @@ class IncognitoEngine:
             return False
         with self._lock:
             leases = self._read_leases()
-            return session_id in leases
+            lease = leases.get(session_id)
+            return bool(lease and not lease.get("pending_burn"))
+
+    def get_protected_session_ids(self) -> set[str]:
+        """Return all session IDs protected from cross-session search (active or pending burn)."""
+        with self._lock:
+            protected: set[str] = set()
+            leases = self._read_leases()
+            for sid, lease in leases.items():
+                protected.add(sid)
+                if isinstance(lease, dict):
+                    for lid in lease.get("lineage_ids", []):
+                        if isinstance(lid, str) and lid:
+                            protected.add(lid)
+            state_db = self.home_dir / "state.db"
+            if SessionDB is not None and state_db.exists():
+                try:
+                    db = SessionDB(db_path=state_db)
+                    try:
+                        for sid in db.session_ids_with_model_config_key("incognito"):
+                            if isinstance(sid, str) and sid:
+                                protected.add(sid)
+                    finally:
+                        if hasattr(db, "close"):
+                            db.close()
+                except Exception:
+                    pass
+            return protected
 
     # -------------------------------------------------------------------------
     # 10. get_session_state
@@ -668,7 +695,57 @@ class IncognitoEngine:
     # 13. burn_session
     # -------------------------------------------------------------------------
 
-    def burn_session(self, session_id: str, reason: str = "burn") -> dict[str, Any]:
+    def _count_db_rows_for_ids(self, state_db: Path, target_ids: set[str]) -> int:
+        """Count remaining rows across sessions and messages tables for target_ids."""
+        if not state_db.is_file() or not target_ids:
+            return 0
+        total = 0
+        try:
+            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+                if cur.fetchone():
+                    for sid in target_ids:
+                        row_s = cur.execute("SELECT count(*) FROM sessions WHERE id = ?", (sid,)).fetchone()
+                        if row_s:
+                            total += int(row_s[0])
+                        row_m = cur.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sid,)).fetchone()
+                        if row_m:
+                            total += int(row_m[0])
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return total
+
+    def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
+        """Retry burning a busy session once its active Gateway turn admission settles."""
+        delays = {1: 1.5, 2: 5.0, 3: 15.0}
+        delay = delays.get(attempt)
+        if delay is None:
+            return
+
+        def _retry() -> None:
+            try:
+                with self._lock:
+                    leases = self._read_leases()
+                    lease = leases.get(session_id)
+                    if not lease or not lease.get("pending_burn"):
+                        return
+                res = self.burn_session(session_id, reason="deferred_burn_retry", _retry_attempt=attempt)
+                if res.get("pending_burn"):
+                    self._schedule_deferred_burn(session_id, attempt=attempt + 1)
+            except Exception as exc:
+                logger.debug("Deferred burn retry failed for %s: %s", session_id, exc)
+
+        timer = threading.Timer(delay, _retry)
+        timer.daemon = True
+        timer.start()
+
+    def burn_session(
+        self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
+    ) -> dict[str, Any]:
         """Perform zero-trace scrub of SQLite rows, transcript files, and RAM vault."""
         if not session_id:
             raise ValueError("session_id must be a non-empty string")
@@ -694,7 +771,9 @@ class IncognitoEngine:
                 except Exception:
                     pass
 
-            # 1. Delete via SessionDB
+            rows_before = self._count_db_rows_for_ids(state_db, target_ids)
+
+            # 1. Delete via SessionDB (retires admissions/workers and removes FTS + session rows)
             db_deleted = False
             if SessionDB is not None and state_db.exists():
                 for sid in list(target_ids):
@@ -710,24 +789,45 @@ class IncognitoEngine:
                         finally:
                             if hasattr(db, "close"):
                                 db.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
 
-            # Extra direct check for SQLite tables (for standalone/pytest environments)
+            # Direct SQLite scrub: commit message deletion independently first so FTS5 and
+            # message content are purged immediately even if sessions_runtime_ledger_delete_guard
+            # defers deleting the sessions row until the turn admission reaches 'terminal'.
             if state_db.is_file():
                 try:
-                    conn = sqlite3.connect(str(state_db))
-                    cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                    if cur.fetchone():
-                        for sid in target_ids:
-                            cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                            cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                        conn.commit()
-                        db_deleted = True
-                    conn.close()
+                    conn = sqlite3.connect(str(state_db), timeout=5.0)
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+                        if cur.fetchone():
+                            for sid in target_ids:
+                                cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                            conn.commit()
+                    except Exception:
+                        pass
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+                        if cur.fetchone():
+                            for sid in target_ids:
+                                cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                            conn.commit()
+                            if rows_before > 0:
+                                db_deleted = True
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
                 except Exception:
                     pass
+
+            rows_after = self._count_db_rows_for_ids(state_db, target_ids)
+            if rows_before > 0 and rows_after == 0:
+                db_deleted = True
+            elif rows_after > 0:
+                db_deleted = False
 
             # 2. Scrub disk files (transcripts and hook outputs)
             settings = self.get_settings()
@@ -788,10 +888,28 @@ class IncognitoEngine:
                 self._kind_counters.pop(sid, None)
                 vault_keys_cleared += len(v)
 
-            # 4. Remove active leases
-            for sid in target_ids:
-                leases.pop(sid, None)
+            # 4. Remove active leases, or retain a pending_burn tombstone if Gateway still holds
+            #    an active turn admission lock on the sessions row so sweep/retry finishes it.
+            pending_burn = rows_after > 0
+            if pending_burn:
+                leases[session_id] = {
+                    **(lease if isinstance(lease, dict) else {}),
+                    "session_id": session_id,
+                    "mode": lease.get("mode", "standard") if isinstance(lease, dict) else "standard",
+                    "pending_burn": True,
+                    "expires_at": 0,
+                    "lineage_ids": sorted(target_ids),
+                }
+                for sid in target_ids:
+                    if sid != session_id:
+                        leases.pop(sid, None)
+            else:
+                for sid in target_ids:
+                    leases.pop(sid, None)
             self._write_leases(leases)
+
+            if pending_burn and _retry_attempt == 0:
+                self._schedule_deferred_burn(session_id, attempt=1)
 
             # 5. Record content-free receipt in audit.json
             now_ts = time.time()
@@ -803,22 +921,26 @@ class IncognitoEngine:
                 "timestamp": now_ts,
                 "reason": reason,
                 "db_deleted": db_deleted,
+                "pending_burn": pending_burn,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
-            audit = self._read_audit()
-            audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
-            audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
-            receipts = audit.setdefault("receipts", [])
-            receipts.append(receipt)
-            self._write_audit(audit)
+            if _retry_attempt == 0 or not pending_burn:
+                audit = self._read_audit()
+                if _retry_attempt == 0:
+                    audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
+                audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
+                receipts = audit.setdefault("receipts", [])
+                receipts.append(receipt)
+                self._write_audit(audit)
 
             return {
                 "ok": True,
                 "session_id": session_id,
                 "reason": reason,
                 "db_deleted": db_deleted,
+                "pending_burn": pending_burn,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
@@ -837,6 +959,9 @@ class IncognitoEngine:
             to_burn: dict[str, str] = {}
 
             for sid, lease in leases.items():
+                if isinstance(lease, dict) and lease.get("pending_burn"):
+                    to_burn[sid] = "pending_burn_retry"
+                    continue
                 expires_at = lease.get("expires_at")
                 owner_pid = lease.get("owner_pid")
                 if expires_at and now >= expires_at:
@@ -853,7 +978,26 @@ class IncognitoEngine:
                         db_incognito_ids = db.session_ids_with_model_config_key("incognito")
                         for sid in db_incognito_ids:
                             if sid not in leases and sid not in to_burn:
-                                to_burn[sid] = "orphaned_db_session"
+                                row = db.get_session(sid) if hasattr(db, "get_session") else None
+                                should_burn_orphan = True
+                                if isinstance(row, dict) and not row.get("ended_at"):
+                                    try:
+                                        mc = json.loads(row.get("model_config") or "{}")
+                                        inc = mc.get("incognito") if isinstance(mc, dict) else None
+                                        if isinstance(inc, dict) and not inc.get("pending_burn"):
+                                            exp = inc.get("expires_at")
+                                            pid = inc.get("owner_pid")
+                                            expired = bool(exp and now >= exp)
+                                            dead = bool(force_dead_pids and pid and pid != os.getpid() and not _is_pid_alive(pid))
+                                            if not expired and not dead:
+                                                # Re-adopt live incognito session into leases instead of burning mid-chat
+                                                leases[sid] = inc
+                                                self._write_leases(leases)
+                                                should_burn_orphan = False
+                                    except Exception:
+                                        pass
+                                if should_burn_orphan:
+                                    to_burn[sid] = "orphaned_db_session"
                     finally:
                         if hasattr(db, "close"):
                             db.close()
@@ -870,7 +1014,9 @@ class IncognitoEngine:
                 audit["orphans_swept"] = audit.get("orphans_swept", 0) + len(to_burn)
                 self._write_audit(audit)
 
-            remaining_leases = self._read_leases()
+            remaining_leases = {
+                k: v for k, v in self._read_leases().items() if not (isinstance(v, dict) and v.get("pending_burn"))
+            }
             return {
                 "ok": True,
                 "swept_count": len(swept_receipts),
@@ -970,6 +1116,9 @@ class IncognitoEngine:
             current_state = self.get_session_state(session_id) if session_id else None
             armed = self.get_armed_state()
             leases = self._read_leases()
+            active_leases = {
+                k: v for k, v in leases.items() if not (isinstance(v, dict) and v.get("pending_burn"))
+            }
             audit = self._read_audit()
             settings = self.get_settings()
 
@@ -984,8 +1133,8 @@ class IncognitoEngine:
                 "session_state": current_state,
                 "current_session": current_state,
                 "armed": armed,
-                "active_count": len(leases),
-                "active_sessions": [self._mask_id(sid) for sid in leases.keys()],
+                "active_count": len(active_leases),
+                "active_sessions": [self._mask_id(sid) for sid in active_leases.keys()],
                 "audit": audit,
                 "metrics": {
                     "sessions_protected": audit.get("sessions_protected", 0),
@@ -1008,48 +1157,222 @@ class IncognitoEngine:
             }
 
     # -------------------------------------------------------------------------
-    # 17. evaluate_tool_guard
+    # 17. evaluate_tool_guard & scrub_tool_result
     # -------------------------------------------------------------------------
 
     def evaluate_tool_guard(
         self, session_id: str, tool_name: str, args: dict[str, Any] | None = None
     ) -> dict[str, str] | None:
-        """Enforce tool execution boundaries for incognito sessions."""
-        if not session_id or not self.is_incognito(session_id):
-            return None
-
+        """Enforce tool execution boundaries for incognito sessions and cross-session reads."""
         with self._lock:
-            leases = self._read_leases()
-            lease = leases.get(session_id, {})
-            mode = lease.get("mode", "standard")
+            calls_to_check: list[tuple[str, dict[str, Any]]] = []
+            if tool_name == "tool_call" and isinstance(args, dict) and isinstance(args.get("calls"), list):
+                for entry in args["calls"]:
+                    if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                        entry_args = entry.get("arguments")
+                        calls_to_check.append((entry["name"], entry_args if isinstance(entry_args, dict) else {}))
+            else:
+                calls_to_check.append((tool_name, args if isinstance(args, dict) else {}))
 
-            # Standard mode blocks persistent mutations
-            if tool_name in ("memory", "skill_manage"):
-                self._record_blocked_write(session_id)
-                return {
-                    "action": "block",
-                    "message": f"Tool '{tool_name}' is blocked in incognito session to prevent persistent state mutations.",
-                }
+            protected_ids = self.get_protected_session_ids()
+            norm_home = str(self.home_dir).replace("\\", "/").lower()
+            is_caller_incog = bool(session_id and self.is_incognito(session_id))
+            caller_mode = "off"
+            if is_caller_incog:
+                leases = self._read_leases()
+                caller_mode = leases.get(session_id, {}).get("mode", "standard")
 
-            # Strict mode also blocks history exploration and background cron
-            if mode == "strict":
-                if tool_name in ("session_search", "cronjob_manage"):
+            for t_name, t_args in calls_to_check:
+                if t_name == "session_search":
+                    target_sid = t_args.get("session_id")
+                    if isinstance(target_sid, str) and target_sid in protected_ids:
+                        return {
+                            "action": "block",
+                            "message": "Target session is protected by incognito mode and cannot be read.",
+                        }
+
+                # Prevent raw SQLite / filesystem bypasses (execute_code, terminal, read_file, search_files)
+                # against state.db / sessions/ whenever any incognito session is active on the host,
+                # or against memories/ when the caller itself is in strict clean-room mode.
+                if (protected_ids or caller_mode == "strict") and t_name in (
+                    "execute_code",
+                    "terminal",
+                    "read_file",
+                    "search_files",
+                ):
+                    payload_blob = json.dumps(t_args, ensure_ascii=False).replace("\\\\", "/").replace("\\", "/").lower()
+                    session_store_markers = (
+                        f"{norm_home}/state.db",
+                        f"{norm_home}/sessions",
+                        f"{norm_home}/hook_outputs",
+                        "hermes/state.db",
+                        "/state.db",
+                    )
+                    if protected_ids and any(m in payload_blob for m in session_store_markers):
+                        if is_caller_incog:
+                            self._record_blocked_write(session_id)
+                        return {
+                            "action": "block",
+                            "message": (
+                                f"Direct access to Hermes session storage via '{t_name}' is blocked while "
+                                "incognito sessions are active. Use 'session_search' instead."
+                            ),
+                        }
+                    if caller_mode == "strict":
+                        strict_markers = (
+                            *session_store_markers,
+                            f"{norm_home}/memories",
+                            "/memories/user.md",
+                            "/memories/memory.md",
+                        )
+                        if any(m in payload_blob for m in strict_markers):
+                            self._record_blocked_write(session_id)
+                            return {
+                                "action": "block",
+                                "message": f"Reading persistent Hermes memory/session storage via '{t_name}' is blocked in strict incognito mode.",
+                            }
+
+            if not is_caller_incog:
+                return None
+
+            mode = caller_mode
+
+            for t_name, _t_args in calls_to_check:
+                # Standard mode blocks persistent mutations
+                if t_name in ("memory", "skill_manage"):
                     self._record_blocked_write(session_id)
                     return {
                         "action": "block",
-                        "message": f"Tool '{tool_name}' is blocked in strict incognito mode.",
-                    }
-                if tool_name == "send_message":
-                    return {
-                        "action": "approve",
-                        "message": "External messaging via 'send_message' requires user confirmation in strict incognito mode.",
+                        "message": f"Tool '{t_name}' is blocked in incognito session to prevent persistent state mutations.",
                     }
 
+                # Strict mode also blocks history exploration and background cron
+                if mode == "strict":
+                    if t_name in ("session_search", "cronjob_manage"):
+                        self._record_blocked_write(session_id)
+                        return {
+                            "action": "block",
+                            "message": f"Tool '{t_name}' is blocked in strict incognito mode.",
+                        }
+                    if t_name == "send_message":
+                        return {
+                            "action": "approve",
+                            "message": "External messaging via 'send_message' requires user confirmation in strict incognito mode.",
+                        }
+
             return None
+
+    def scrub_tool_result(
+        self,
+        session_id: str,
+        tool_name: str,
+        args: dict[str, Any] | None = None,
+        result: Any = None,
+    ) -> str | None:
+        """Filter incognito sessions out of cross-session search and tool outputs."""
+        if not isinstance(result, str) or not result:
+            return None
+        if tool_name not in ("session_search", "tool_call", "execute_code", "terminal", "read_file", "search_files"):
+            return None
+
+        protected_ids = self.get_protected_session_ids()
+        if not protected_ids:
+            return None
+
+        # Quick substring check before parsing
+        if not any(pid in result for pid in protected_ids):
+            return None
+
+        if tool_name not in ("session_search", "tool_call"):
+            # Scrub lines referencing protected session IDs in raw execution/file outputs
+            scrubbed_lines = [
+                "[REDACTED INCOGNITO SESSION]" if any(pid in line for pid in protected_ids) else line
+                for line in result.splitlines(keepends=True)
+            ]
+            return "".join(scrubbed_lines)
+
+        try:
+            data = json.loads(result)
+        except Exception:
+            return None
+
+        modified = False
+
+        def _scrub_payload(node: Any) -> Any:
+            nonlocal modified
+            if isinstance(node, dict):
+                sid = node.get("session_id")
+                if isinstance(sid, str) and sid in protected_ids:
+                    modified = True
+                    return {"success": False, "error": "Session is protected by incognito mode."}
+                cleaned: dict[str, Any] = {}
+                for k, v in node.items():
+                    if k in ("results", "sessions", "matches") and isinstance(v, list):
+                        filtered = [
+                            item
+                            for item in v
+                            if not (isinstance(item, dict) and item.get("session_id") in protected_ids)
+                        ]
+                        if len(filtered) != len(v):
+                            modified = True
+                            cleaned[k] = [_scrub_payload(item) for item in filtered]
+                            continue
+                    cleaned[k] = _scrub_payload(v)
+                if modified and "results" in cleaned and isinstance(cleaned["results"], list):
+                    if "count" in cleaned and isinstance(cleaned["count"], int):
+                        cleaned["count"] = len(cleaned["results"])
+                    if "total" in cleaned and isinstance(cleaned["total"], int):
+                        cleaned["total"] = len(cleaned["results"])
+                return cleaned
+            elif isinstance(node, list):
+                filtered_list = [
+                    _scrub_payload(item)
+                    for item in node
+                    if not (isinstance(item, dict) and item.get("session_id") in protected_ids)
+                ]
+                if len(filtered_list) != len(node):
+                    modified = True
+                return filtered_list
+            return node
+
+        scrubbed = _scrub_payload(data)
+        if not modified:
+            return None
+        return json.dumps(scrubbed, ensure_ascii=False)
 
     # -------------------------------------------------------------------------
     # 18. transform_llm_request
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_memory_blocks(text: str) -> str:
+        """Strip Hermes MEMORY and USER PROFILE blocks across both double-bar and single-bar layouts."""
+        if not text:
+            return text
+        # 1. Standard Hermes double-bar layout:
+        #    ══════\nMEMORY (your personal notes) [99% — ...]\n══════\n<entries>
+        #    Ends before the next ══════ block, plugin section, profile/timestamp/runtime trailer, or EOF.
+        double_bar = re.compile(
+            r"(?is)[═=\-_]{5,}\s*\n\s*(?:MEMORY|USER PROFILE)\s*\([^)]*\)[^\n]*\n[═=\-_]{5,}\s*\n.*?"
+            r"(?=\n\n(?:[═=\-_]{5,}|<!--\s*hermes-plugin-sections:start\s*-->|##\s+Plugin Context:|"
+            r"Active Hermes profile:|Conversation started:|#\s+Hermes runtime environment)|\n[═=\-_]{5,}\s*\n|\Z)"
+        )
+        res = double_bar.sub("", text)
+
+        # 2. Single-bar or markdown heading layout (e.g. unit tests / compact prompts):
+        #    ══════\nMEMORY (your personal notes)\n<entries>\n══════
+        single_bar = re.compile(
+            r"(?is)(?:[═=\-_]{5,}\s*\n)?\s*(?:MEMORY|USER PROFILE)\s*\([^)]*\)[^\n]*\n.*?"
+            r"(?=(?:[═=\-_]{5,}\s*\n)|\n\n(?:<!--\s*hermes-plugin-sections:start\s*-->|##\s+Plugin Context:|"
+            r"Active Hermes profile:|Conversation started:|#\s+Hermes runtime environment)|\Z)"
+        )
+        if re.search(r"(?i)(?:MEMORY|USER PROFILE)\s*\([^)]*\)", res):
+            res = single_bar.sub("", res)
+            res = re.sub(r"[═=\-_]{5,}\s*\n?", "", res)
+
+        # Collapse excess blank lines left behind by removed blocks
+        res = re.sub(r"\n{3,}", "\n\n", res)
+        return res.strip()
 
     def transform_llm_request(self, session_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
         """Sanitize LLM requests: strip profile memory, redact PII, and attach ZDR hints."""
@@ -1069,40 +1392,60 @@ class IncognitoEngine:
             new_req = copy.deepcopy(request)
             modified = False
 
-            # In strict mode, strip persistent memory sections from messages
-            if mode == "strict" and "messages" in new_req and isinstance(new_req["messages"], list):
-                def _strip_memory_blocks(text: str) -> str:
-                    p = re.compile(
-                        r"(?i)(?:[═=\-_]{5,}\s*\n)?\s*(?:MEMORY|USER PROFILE)\s*\([^)]*\)[^\n]*\n.*?(?=(?:[═=\-_]{5,}\s*\n)|$)",
-                        re.DOTALL,
-                    )
-                    res = p.sub("", text)
-                    res = re.sub(r"[═=\-_]{5,}\s*\n", "", res)
-                    return res.strip()
-
-                for msg in new_req["messages"]:
-                    if not isinstance(msg, dict):
-                        continue
-                    content = msg.get("content")
-                    if isinstance(content, str):
-                        stripped = _strip_memory_blocks(content)
-                        if stripped != content:
-                            msg["content"] = stripped
+            def _apply_text_transform(container: dict[str, Any], fn: Callable[[str], str], reason_tag: str) -> None:
+                nonlocal modified
+                # Top-level string or block-list fields (Anthropic 'system', Codex 'instructions')
+                for top_key in ("system", "instructions"):
+                    val = container.get(top_key)
+                    if isinstance(val, str):
+                        updated = fn(val)
+                        if updated != val:
+                            container[top_key] = updated
                             modified = True
-                            if "stripped_profile_memory" not in reasons:
-                                reasons.append("stripped_profile_memory")
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                                stripped = _strip_memory_blocks(part["text"])
-                                if stripped != part["text"]:
-                                    part["text"] = stripped
+                            if reason_tag and reason_tag not in reasons:
+                                reasons.append(reason_tag)
+                    elif isinstance(val, list):
+                        for block in val:
+                            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                                updated = fn(block["text"])
+                                if updated != block["text"]:
+                                    block["text"] = updated
                                     modified = True
-                                    if "stripped_profile_memory" not in reasons:
-                                        reasons.append("stripped_profile_memory")
+                                    if reason_tag and reason_tag not in reasons:
+                                        reasons.append(reason_tag)
+
+                # Message arrays (OpenAI/Gemini 'messages', Codex Responses 'input')
+                for list_key in ("messages", "input"):
+                    msgs = container.get(list_key)
+                    if not isinstance(msgs, list):
+                        continue
+                    for msg in msgs:
+                        if not isinstance(msg, dict):
+                            continue
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            updated = fn(content)
+                            if updated != content:
+                                msg["content"] = updated
+                                modified = True
+                                if reason_tag and reason_tag not in reasons:
+                                    reasons.append(reason_tag)
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                    updated = fn(part["text"])
+                                    if updated != part["text"]:
+                                        part["text"] = updated
+                                        modified = True
+                                        if reason_tag and reason_tag not in reasons:
+                                            reasons.append(reason_tag)
+
+            # In strict mode, strip persistent memory sections from system/instructions/messages
+            if mode == "strict":
+                _apply_text_transform(new_req, self._strip_memory_blocks, "stripped_profile_memory")
 
             # Outbound PII redaction via reversible vault
-            if redact_pii and "messages" in new_req and isinstance(new_req["messages"], list):
+            if redact_pii:
                 vault = self._vaults.setdefault(session_id, {})
                 reverse_vault = self._reverse_vaults.setdefault(session_id, {})
                 kind_counters = self._kind_counters.setdefault(session_id, {})
@@ -1122,35 +1465,16 @@ class IncognitoEngine:
                 def _redact_text(text: str) -> str:
                     if not text:
                         return text
-                    # Redact emails
                     text = _EMAIL_PATTERN.sub(lambda m: _mask_value(m.group(0), "EMAIL"), text)
-                    # Redact phones
                     text = _PHONE_PATTERN.sub(lambda m: _mask_value(m.group(0), "PHONE"), text)
-                    # Redact credit cards
                     text = _CARD_PATTERN.sub(lambda m: _mask_value(m.group(0), "CARD"), text)
-                    # Redact SSNs
                     text = _SSN_PATTERN.sub(lambda m: _mask_value(m.group(0), "SSN"), text)
-                    # Redact Bearer tokens
                     text = _BEARER_PATTERN.sub(lambda m: f"Bearer {_mask_value(m.group(1), 'SECRET')}", text)
-                    # Redact key assignments
                     text = _SECRET_ASSIGN_PATTERN.sub(lambda m: f"{m.group(1)}={_mask_value(m.group(2), 'SECRET')}", text)
                     return text
 
                 redaction_count_before = len(vault)
-                for msg in new_req["messages"]:
-                    if not isinstance(msg, dict):
-                        continue
-                    content = msg.get("content")
-                    if isinstance(content, str):
-                        redacted = _redact_text(content)
-                        if redacted != content:
-                            msg["content"] = redacted
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                                redacted = _redact_text(part["text"])
-                                if redacted != part["text"]:
-                                    part["text"] = redacted
+                _apply_text_transform(new_req, _redact_text, "")
 
                 new_redactions = len(vault) - redaction_count_before
                 if new_redactions > 0:
