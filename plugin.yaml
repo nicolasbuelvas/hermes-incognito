@@ -1,0 +1,70 @@
+name: incognito
+version: "1.0.0"
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.22.0"
+author: Nicolas Buelvas
+license: MIT
+homepage: https://github.com/nicolasbuelvas/hermes-incognito
+description: >-
+  Zero-trace ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and
+  Desktop: hides active chats from sidebars and listings, blocks persistent
+  memory and skill mutations, strips profile memory in strict mode, optionally
+  redacts outbound PII in RAM, and scrubs SQLite compression chains and
+  transcript artifacts on close or TTL expiry.
+tags:
+  - privacy
+  - incognito
+  - ephemeral
+  - sessions
+  - security
+  - desktop
+provides_tools:
+  - incognito_control
+  - incognito_verify
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_tool_call
+  - post_compaction
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset
+provides_middleware:
+  - llm_request
+  - llm_execution
+config_schema:
+  default_mode:
+    type: str
+    choices:
+      - "off"
+      - standard
+      - strict
+    default: "off"
+    label: Default session mode
+    description: Start every new session in off, standard incognito, or strict clean-room mode.
+  auto_purge_on_exit:
+    type: bool
+    default: true
+    label: Purge session on close
+    description: Automatically delete SQLite rows, compression continuations, and session files when an incognito chat ends.
+  default_ttl_minutes:
+    type: int
+    default: 60
+    label: Idle TTL (minutes)
+    description: Maximum idle lifetime in minutes before orphan sweeps purge an inactive incognito session (0 disables TTL).
+  redact_outbound_pii:
+    type: bool
+    default: false
+    label: Redact outbound PII in RAM
+    description: Mask emails, phone numbers, payment cards, and secrets with reversible RAM-only placeholders before provider requests.
+  provider_zdr_hints:
+    type: bool
+    default: true
+    label: Send provider privacy hints
+    description: Attach non-retention hints where supported by compatible providers.
+  zero_fill_files:
+    type: bool
+    default: true
+    label: Zero-fill files before deletion
+    description: Overwrite transcript JSONL and hook spill files with zero bytes prior to unlinking.

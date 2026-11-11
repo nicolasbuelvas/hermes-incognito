@@ -1,0 +1,12 @@
+[project]
+name = "hermes-incognito"
+version = "1.0.0"
+description = "Zero-trace ephemeral and incognito sessions plugin for Hermes Agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
