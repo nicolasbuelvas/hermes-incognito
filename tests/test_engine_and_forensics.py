@@ -296,3 +296,66 @@ def test_engine_concurrency(isolated_hermes_env):
         t.join()
 
     assert not errors, f"Concurrency errors occurred: {errors}"
+
+
+def test_engine_burn_busy_session_purges_messages_and_defers_session_row(isolated_hermes_env, monkeypatch):
+    """
+    Regression test for Gateway runtime race: when SQLite's sessions_runtime_ledger_delete_guard
+    blocks DELETE FROM sessions while a turn admission is still settling, burn_session must:
+      1) Immediately purge all rows from messages (wiping FTS/content right away).
+      2) Retain a pending_burn tombstone in leases (keeping get_protected_session_ids() active).
+      3) Complete full zero-trace deletion on the next sweep_expired() once the guard clears.
+    """
+    if IncognitoEngine is None:
+        pytest.skip("IncognitoEngine not yet importable")
+
+    monkeypatch.setattr(engine, "SessionDB", None)
+    tmp_path = isolated_hermes_env["home"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
+
+    sess_id = "local-busy-admission-chat"
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS admission_guard (session_id TEXT PRIMARY KEY)")
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS guard_busy_session
+            BEFORE DELETE ON sessions
+            WHEN EXISTS (SELECT 1 FROM admission_guard WHERE session_id = old.id)
+            BEGIN
+                SELECT RAISE(ABORT, 'session_busy');
+            END;
+            """
+        )
+        conn.execute("INSERT INTO admission_guard (session_id) VALUES (?)", (sess_id,))
+        conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (sess_id, "Recordar color stiven"))
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            ("m-secret-1", sess_id, "user", "Mi color favorito es stiven"),
+        )
+        conn.commit()
+
+    eng.enable_session(sess_id, mode="strict")
+    burn_res = eng.burn_session(sess_id, reason="session_finalize")
+
+    # Messages MUST be wiped immediately even though sessions row is temporarily guarded
+    with sqlite3.connect(str(db_path)) as conn:
+        msg_count = conn.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,)).fetchone()[0]
+        sess_count = conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,)).fetchone()[0]
+    assert msg_count == 0
+    assert sess_count == 1
+    assert burn_res["db_deleted"] is False
+    assert burn_res["pending_burn"] is True
+    assert eng.is_incognito(sess_id) is False
+    assert sess_id in eng.get_protected_session_ids()
+
+    # Once Gateway marks admission terminal (guard cleared), sweep_expired completes zero-trace
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM admission_guard WHERE session_id = ?", (sess_id,))
+        conn.commit()
+
+    eng.sweep_expired()
+    verify = eng.verify_zero_trace(sess_id)
+    assert verify["zero_trace"] is True
+    assert sess_id not in eng.get_protected_session_ids()

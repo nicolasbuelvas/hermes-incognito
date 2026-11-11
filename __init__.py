@@ -93,9 +93,20 @@ def register(ctx: Any) -> None:
     def pre_tool_call(
         tool_name: str = "", args: Optional[dict[str, Any]] = None, session_id: str = "", **kwargs: Any
     ) -> Optional[dict[str, str]]:
-        """Guard against persistent state mutations during incognito sessions."""
+        """Guard against persistent state mutations and cross-session incognito reads."""
         sid = _resolve_session_id(kwargs, session_id)
         return engine.evaluate_tool_guard(sid, tool_name, args)
+
+    def transform_tool_result(
+        tool_name: str = "",
+        args: Optional[dict[str, Any]] = None,
+        result: Any = None,
+        session_id: str = "",
+        **kwargs: Any,
+    ) -> Optional[str]:
+        """Scrub active or pending-burn incognito sessions from cross-session search results."""
+        sid = _resolve_session_id(kwargs, session_id)
+        return engine.scrub_tool_result(sid, tool_name, args, result)
 
     def post_compaction(old_session_id: str = "", session_id: str = "", **kwargs: Any) -> None:
         """Propagate incognito protection and in-RAM vaults to compacted sessions."""
@@ -128,6 +139,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("pre_tool_call", pre_tool_call)
+    ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("post_compaction", post_compaction)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("on_session_finalize", on_session_cleanup)
@@ -292,9 +304,34 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         name="incognito",
         handler=handle_slash_command,
-        description="Control zero-trace incognito mode for this session",
-        args_hint="[on|off|strict|burn|status|sweep|ttl <min>|arm|verify <id>]",
+        description="Toggle or manage zero-trace incognito mode for this session",
+        args_hint="[on|strict|off|burn|status|sweep|ttl <min>|arm|verify <id>]",
     )
+
+    # Register direct subcommand aliases so TUI/CLI/Desktop '/' autocomplete popup
+    # displays all incognito suboptions immediately when typing '/incognito'.
+    _slash_suboptions = (
+        ("incognito-strict", "strict", "Enable strict clean-room incognito mode (strips profile & memory)"),
+        ("incognito-on", "on standard", "Enable standard ephemeral incognito mode for this session"),
+        ("incognito-off", "off", "Disable incognito mode and retain conversation history"),
+        ("incognito-burn", "burn", "Immediately scrub, zero-fill, and delete this session"),
+        ("incognito-status", "status", "Show active incognito mode, TTL, and blocked writes"),
+        ("incognito-arm", "arm", "Arm the next new session to start in incognito mode"),
+        ("incognito-sweep", "sweep", "Purge expired or orphaned incognito sessions"),
+        ("incognito-verify", "verify", "Audit SQLite, disk, and RAM for zero residual trace"),
+    )
+    for alias_name, preset_prefix, alias_desc in _slash_suboptions:
+        def _make_alias_handler(prefix: str) -> Callable[..., str]:
+            def _alias_handler(raw_args: str = "", **kw: Any) -> str:
+                merged = f"{prefix} {raw_args}".strip() if raw_args.strip() else prefix
+                return handle_slash_command(merged, **kw)
+            return _alias_handler
+
+        ctx.register_command(
+            name=alias_name,
+            handler=_make_alias_handler(preset_prefix),
+            description=alias_desc,
+        )
 
     # -------------------------------------------------------------------------
     # 5. Register CLI Subcommand (hermes incognito ...)

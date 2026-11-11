@@ -30,6 +30,7 @@ provides_hooks:
   - on_session_end
   - on_session_finalize
   - on_session_reset
+  - transform_tool_result
 provides_middleware:
   - llm_request
   - llm_execution
