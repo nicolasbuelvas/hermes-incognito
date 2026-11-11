@@ -6,8 +6,8 @@ import pytest
 from pathlib import Path
 
 # Setup paths
-PROJECT_ROOT = Path("C:/Users/nicol/Downloads/Proyectos personales/hermes-incognito").resolve()
-HERMES_APP_DATA = Path("C:/Users/nicol/AppData/Local/hermes/hermes-agent").resolve()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HERMES_APP_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".hermes"))) / "hermes" / "hermes-agent"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))

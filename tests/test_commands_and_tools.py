@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path("C:/Users/nicol/Downloads/Proyectos personales/hermes-incognito").resolve()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_plugin_pkg():
