@@ -109,6 +109,53 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     return {"ok": True, "session_id": session_id}
 
 
+def _bool_or_none(value: Any) -> Optional[bool]:
+    return None if value is None else bool(value)
+
+
+@router.post("/enable")
+def enable_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    """Turn Incognito on for a session, or switch its level in place. Never turns it off."""
+    eng = _resolve_engine()
+    if eng is None:
+        return {"ok": False, "error": "engine unavailable"}
+
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+    mode = str(body.get("mode") or "standard").strip().lower()
+    if mode not in ("standard", "strict"):
+        return {"ok": False, "error": "mode must be 'standard' or 'strict'"}
+    ttl = body.get("ttl_minutes")
+    result = eng.enable_session(
+        session_id,
+        mode=mode,
+        ttl_minutes=int(ttl) if ttl is not None else None,
+        redact_pii=_bool_or_none(body.get("redact_pii")),
+    )
+    if not result.get("ok"):
+        return result
+    return {**eng.status_summary(session_id=session_id), "ok": True}
+
+
+@router.post("/disable")
+def disable_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    """Turn Incognito off for a session and keep its history."""
+    eng = _resolve_engine()
+    if eng is None:
+        return {"ok": False, "error": "engine unavailable"}
+
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+    if not eng.is_incognito(session_id):
+        return {"ok": False, "error": "This chat is not in Incognito."}
+    result = eng.disable_session(session_id, action="keep")
+    if not result.get("ok"):
+        return result
+    return {**eng.status_summary(session_id=session_id), "ok": True}
+
+
 @router.post("/arm")
 def arm_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     eng = _resolve_engine()

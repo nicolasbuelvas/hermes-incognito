@@ -48,7 +48,7 @@ Hermes Incognito operates as an in-process security and privacy layer intercepti
 | **Cross-Session Search (`session_search`)** | Allowed | Allowed | **Blocked** |
 | **Scheduled Tasks (`cronjob_manage`)** | Allowed | Allowed | **Blocked** |
 | **Outbound Profile / Notes Stripping** | No | No | **Enforced in RAM** |
-| **Reversible In-RAM PII Masking** | Disabled | Optional | Optional / Enabled |
+| **Reversible In-RAM PII Masking** | Disabled | Optional (`redact_pii`) | Optional (`redact_pii`); on by default when Desktop starts a Strict chat |
 | **Provider Non-Retention Hints (ZDR)** | No | Attached | Attached |
 | **Zero-Fill Prior to Unlink** | No | Yes | Yes |
 | **Cryptographic Zero-Trace Audit** | N/A | Supported | Supported |
@@ -135,11 +135,15 @@ The plugin registers two tools for autonomous or user-guided privacy operations:
 
 When used with Hermes Desktop, Incognito provides native integration:
 
-- **High-Contrast Privacy Banner (`COMPOSER_AREAS.top`):** Appears above the composer when an incognito session or armed draft is active. Displays real-time counters for blocked writes, RAM redactions, and remaining TTL, alongside instant `Switch Strict/Standard`, `Keep & Exit`, and `Burn Now` buttons.
-- **Status Bar Indicator (`STATUSBAR_AREAS.right`):** One-click indicator showing `INCOGNITO: ON (STRICT)`, `INCOGNITO: ON (STANDARD)`, `INCOGNITO: ARMED`, or `INCOGNITO: OFF`.
-- **Keyboard Shortcut (`KEYBINDS_AREA`):** Press `Ctrl+Shift+I` (or `Cmd+Shift+I` on macOS) to instantly toggle incognito mode on the focused chat.
-- **Command Palette (`PALETTE_AREA`):** Five registered commands for quick navigation, arming, burning, and mode switching.
-- **Privacy Control Center (`ROUTES_AREA` & `SIDEBAR_NAV_AREA`):** Dedicated `/incognito` dashboard featuring real-time telemetry, session arming toggles, and an interactive Forensic Zero-Trace Verifier.
+The Desktop UI uses the Hermes UI kit (`Badge`, `SegmentedControl`, `ToggleRow`, `Tip`, `ConfirmDialog`) and theme variables, so it follows the active Hermes theme. Newer kit pieces are feature-detected, with plain fallbacks on older Desktop builds.
+
+- **First-run hint (`COMPOSER_AREAS.top`):** A dismissible note above the composer explains the two levels and offers **Try Standard** and **Compare levels**. It stays dismissed after you close it, try a level, or open the Incognito page.
+- **Chat banner (`COMPOSER_AREAS.top`):** While a chat is in Incognito, shows the level (with a tooltip that explains it), the auto-delete deadline and time left (for example, `Deleted after 60 min idle · 42 min left`), and whether personal details are masked. Buttons: **Switch to Strict/Standard**, **Exit Incognito, keep chat**, and **Delete now…**.
+- **Status bar (`STATUSBAR_AREAS.right`):** `Incognito off`, `Incognito · Standard`, `Incognito · Strict`, or `Next chat: Incognito · …`, with a tooltip. Clicking it turns Incognito on (Standard) or off (keeps the chat).
+- **Keyboard shortcut (`KEYBINDS_AREA`):** `Ctrl+Shift+I` (`Cmd+Shift+I` on macOS) turns Incognito on or off for the focused chat. The toast states the resulting state.
+- **Command palette (`PALETTE_AREA`):** Turn on or off, use Standard, use Strict, start the next new chat in Incognito, delete this chat, and open the privacy levels page.
+- **Incognito page (`ROUTES_AREA` and `SIDEBAR_NAV_AREA`):** A level picker (Normal, Standard, Strict) for the focused chat, with what each level protects, a **Mask personal details** switch, a **Next new chat** picker, a **When to use each level** guide, and a collapsed **Advanced** section with content-free totals and the leftover check (zero-trace verifier).
+- **Delete confirmation:** Every delete entry point asks first: "Delete this chat permanently?".
 
 ---
 

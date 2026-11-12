@@ -370,3 +370,55 @@ def test_tests_never_use_a_real_sessiondb():
     assert engine.SessionDB is None
     hermes_paths = [p for p in sys.path if "hermes-agent" in p.replace("\\", "/")]
     assert not hermes_paths
+
+
+# --- Desktop UX: explicit enable/disable endpoints --------------------------------------------
+
+
+def test_rest_enable_is_idempotent_and_switches_in_place(isolated_hermes_env):
+    first = plugin_api.enable_session({"session_id": "ux-1", "mode": "standard"})
+    assert first["ok"] and first["incognito"] is True and first["mode"] == "standard"
+
+    # Engaging the same level twice must never turn Incognito off.
+    again = plugin_api.enable_session({"session_id": "ux-1", "mode": "standard"})
+    assert again["ok"] and again["incognito"] is True and again["mode"] == "standard"
+
+    switched = plugin_api.enable_session({"session_id": "ux-1", "mode": "strict"})
+    assert switched["ok"] and switched["mode"] == "strict"
+    assert switched["session_state"]["redact_pii"] is False
+
+    masked = plugin_api.enable_session({"session_id": "ux-1", "mode": "strict", "redact_pii": True})
+    assert masked["session_state"]["redact_pii"] is True
+    kept = plugin_api.enable_session({"session_id": "ux-1", "mode": "standard"})
+    assert kept["session_state"]["redact_pii"] is True
+
+
+def test_rest_disable_turns_off_and_keeps_history(isolated_hermes_env):
+    transcript = _transcript(isolated_hermes_env, "ux-2")
+    plugin_api.enable_session({"session_id": "ux-2", "mode": "strict"})
+
+    result = plugin_api.disable_session({"session_id": "ux-2"})
+    assert result["ok"] and result["incognito"] is False
+    assert transcript.exists()
+
+    assert plugin_api.disable_session({"session_id": "ux-2"})["ok"] is False
+
+
+@pytest.mark.parametrize("body", [{}, {"session_id": "bad.id"}, {"session_id": "ok-id", "mode": "off"}])
+def test_rest_enable_rejects_bad_input(isolated_hermes_env, body):
+    assert plugin_api.enable_session(body)["ok"] is False
+    assert plugin_api.disable_session({"session_id": body.get("session_id", "")})["ok"] is False
+
+
+def test_rpc_enable_and_disable(isolated_hermes_env):
+    ctx = _Ctx()
+    plugin_init.register(ctx)
+    assert {"enable", "disable"} <= set(ctx.rpcs)
+
+    on = ctx.rpcs["enable"]({"session_id": "ux-3", "mode": "strict", "redact_pii": True})
+    assert on["ok"] and on["mode"] == "strict" and on["session_state"]["redact_pii"] is True
+    assert ctx.rpcs["enable"]({"session_id": "ux-3", "mode": "strict"})["incognito"] is True
+
+    off = ctx.rpcs["disable"]({"session_id": "ux-3"})
+    assert off["ok"] and off["incognito"] is False
+    assert ctx.rpcs["enable"]({"session_id": "ux-3", "mode": "nope"})["ok"] is False
