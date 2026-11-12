@@ -1,19 +1,17 @@
 import json
-import os
 import sys
-import tempfile
 import sqlite3
 import pytest
 from pathlib import Path
 
-# Setup paths
+# Setup paths. The suite never adds a local Hermes install to sys.path: tests must not pick up
+# a real SessionDB, config, or plugin storage from ~/.hermes, so results stay deterministic.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-HERMES_APP_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".hermes"))) / "hermes" / "hermes-agent"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if HERMES_APP_DATA.exists() and str(HERMES_APP_DATA) not in sys.path:
-    sys.path.insert(0, str(HERMES_APP_DATA))
+
+_ENGINE_MODULES = ("engine", "hermes_plugin_incognito_test.engine")
 
 
 class MockSessionDB:
@@ -96,6 +94,17 @@ def isolated_hermes_env(tmp_path, monkeypatch):
     and resetting IncognitoEngine before and after each test.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # Even if hermes_state / hermes_cli happen to be importable, use isolated fallbacks.
+    # Tests that need a database opt in with monkeypatch.setattr(engine, "SessionDB", MockSessionDB).
+    import engine as _engine  # noqa: F401  (ensure the top-level module is loaded)
+    for name in _ENGINE_MODULES:
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        monkeypatch.setattr(mod, "SessionDB", None, raising=False)
+        monkeypatch.setattr(mod, "plugin_data_dir", None, raising=False)
+        monkeypatch.setattr(mod, "load_config_readonly", lambda: {}, raising=False)
 
     sessions_dir = tmp_path / "sessions"
     hook_outputs_dir = tmp_path / "hook_outputs"
