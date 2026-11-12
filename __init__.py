@@ -241,7 +241,9 @@ def register(ctx: Any) -> None:
         if subcmd in ("off", "disable"):
             action = "burn" if len(parts) > 1 and parts[1].lower() == "burn" else "keep"
             if sid:
-                engine.disable_session(sid, action=action)
+                res = engine.disable_session(sid, action=action)
+                if not res.get("ok"):
+                    return f"Cannot disable/burn session {sid}: {res.get('error', 'not an incognito session')}."
                 _emit_state()
                 if action == "burn":
                     return f"Session {sid} burned: SQLite rows purged, transcript files scrubbed, RAM cleared."
@@ -252,6 +254,8 @@ def register(ctx: Any) -> None:
         if subcmd == "burn":
             if sid:
                 res = engine.burn_session(sid, reason="slash_burn")
+                if not res.get("ok"):
+                    return f"Cannot burn session {sid}: {res.get('error', 'not an incognito session')}."
                 _emit_state()
                 return f"Incognito session {sid} burned. Files scrubbed: {res.get('files_scrubbed', 0)}. (Receipt: {res.get('receipt_id')})"
             return "No active session ID to burn."
@@ -447,13 +451,15 @@ def register(ctx: Any) -> None:
             res = engine.burn_session(target_sid, reason="cli_burn")
             if as_json:
                 print(json.dumps(res, indent=2))
+            elif not res.get("ok"):
+                print(f"Error: {res.get('error', 'Failed to burn session')}")
             else:
                 print(
                     f"✓ Burned session {target_sid}: DB deleted={res.get('db_deleted')}, "
                     f"Files scrubbed={res.get('files_scrubbed')}, "
                     f"Vault cleared={res.get('vault_keys_cleared')} (Receipt: {res.get('receipt_id')})"
                 )
-            return 0
+            return 0 if res.get("ok") else 1
 
         elif cmd == "verify":
             target_sid = getattr(args, "session_id", "")

@@ -107,6 +107,37 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 VALID_MODES: tuple[str, ...] = ("off", "standard", "strict")
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _is_valid_session_id(session_id: Any) -> bool:
+    """Validate session_id against a strict filename-safe pattern (no '/', '\\', '..', or roots)."""
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 256:
+        return False
+    if "/" in session_id or "\\" in session_id or ".." in session_id or "\x00" in session_id:
+        return False
+    p = Path(session_id)
+    if p.is_absolute() or p.drive or p.root or p.name != session_id:
+        return False
+    return bool(_SAFE_SESSION_ID_RE.fullmatch(session_id))
+
+
+def _session_exact_filenames(target_ids: set[str]) -> set[str]:
+    """Exact transcript/snapshot filenames for target session IDs in $HERMES_HOME/sessions/."""
+    names: set[str] = set()
+    for sid in target_ids:
+        if _is_valid_session_id(sid):
+            names.update((f"{sid}.jsonl", f"{sid}.json", f"session_{sid}.json", f"session_{sid}.jsonl"))
+    return names
+
+
+def _hook_exact_filenames(target_ids: set[str]) -> set[str]:
+    """Exact flat hook-output filenames for target session IDs in $HERMES_HOME/hook_outputs/."""
+    names: set[str] = set()
+    for sid in target_ids:
+        if _is_valid_session_id(sid):
+            names.update((f"{sid}.txt", f"{sid}.json", f"{sid}.jsonl"))
+    return names
 
 # Common PII and credential patterns for in-RAM reversible vault
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -402,6 +433,8 @@ class IncognitoEngine:
         """Enable incognito mode for a session, hiding it in SQLite and registering lease."""
         if not session_id or not isinstance(session_id, str):
             raise ValueError("session_id must be a non-empty string")
+        if not _is_valid_session_id(session_id):
+            raise ValueError("Invalid session_id format")
         if mode not in ("standard", "strict"):
             raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
 
@@ -747,89 +780,71 @@ class IncognitoEngine:
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
     ) -> dict[str, Any]:
         """Perform zero-trace scrub of SQLite rows, transcript files, and RAM vault."""
-        if not session_id:
+        if not session_id or not isinstance(session_id, str):
             raise ValueError("session_id must be a non-empty string")
+        if not _is_valid_session_id(session_id):
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "error": "Invalid session_id format",
+            }
 
         with self._lock:
-            target_ids: set[str] = {session_id}
             leases = self._read_leases()
-            lease = leases.get(session_id, {})
-            for lid in lease.get("lineage_ids", []):
-                target_ids.add(lid)
+            raw_lease = leases.get(session_id)
+            has_incognito_lease = isinstance(raw_lease, dict)
 
             state_db = self.home_dir / "state.db"
+            has_db_incognito_tag = False
+            db_delete_targets: list[str] = []
             if SessionDB is not None and state_db.exists():
                 try:
                     db = SessionDB(db_path=state_db)
                     try:
-                        targets = db.get_session_delete_targets(session_id)
-                        if targets:
-                            target_ids.update(targets)
+                        if not has_incognito_lease:
+                            if hasattr(db, "get_session_model_config_value"):
+                                has_db_incognito_tag = bool(
+                                    db.get_session_model_config_value(session_id, "incognito")
+                                )
+                            if not has_db_incognito_tag and hasattr(db, "session_ids_with_model_config_key"):
+                                has_db_incognito_tag = session_id in db.session_ids_with_model_config_key(
+                                    "incognito"
+                                )
+                            if not has_db_incognito_tag and hasattr(db, "get_session"):
+                                row = db.get_session(session_id)
+                                if isinstance(row, dict) and row.get("model_config"):
+                                    mc = json.loads(row["model_config"])
+                                    has_db_incognito_tag = isinstance(mc, dict) and bool(mc.get("incognito"))
+                        if (has_incognito_lease or has_db_incognito_tag) and hasattr(
+                            db, "get_session_delete_targets"
+                        ):
+                            targets = db.get_session_delete_targets(session_id)
+                            if targets:
+                                db_delete_targets = [t for t in targets if _is_valid_session_id(t)]
                     finally:
                         if hasattr(db, "close"):
                             db.close()
                 except Exception:
                     pass
 
+            if not has_incognito_lease and not has_db_incognito_tag:
+                return {
+                    "ok": False,
+                    "session_id": session_id,
+                    "error": f"Session '{session_id}' is not an incognito session",
+                }
+
+            lease = raw_lease if isinstance(raw_lease, dict) else {}
+            target_ids: set[str] = {session_id}
+            for lid in lease.get("lineage_ids", []):
+                if _is_valid_session_id(lid):
+                    target_ids.add(lid)
+            target_ids.update(db_delete_targets)
+
             rows_before = self._count_db_rows_for_ids(state_db, target_ids)
 
-            # 1. Delete via SessionDB (retires admissions/workers and removes FTS + session rows)
-            db_deleted = False
-            if SessionDB is not None and state_db.exists():
-                for sid in list(target_ids):
-                    try:
-                        db = SessionDB(db_path=state_db)
-                        try:
-                            if db.delete_session(
-                                sid,
-                                sessions_dir=self.home_dir / "sessions",
-                                include_compression_chain=True,
-                            ):
-                                db_deleted = True
-                        finally:
-                            if hasattr(db, "close"):
-                                db.close()
-                    except Exception as exc:
-                        logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
-
-            # Direct SQLite scrub: commit message deletion independently first so FTS5 and
-            # message content are purged immediately even if sessions_runtime_ledger_delete_guard
-            # defers deleting the sessions row until the turn admission reaches 'terminal'.
-            if state_db.is_file():
-                try:
-                    conn = sqlite3.connect(str(state_db), timeout=5.0)
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
-                        if cur.fetchone():
-                            for sid in target_ids:
-                                cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                            conn.commit()
-                    except Exception:
-                        pass
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                        if cur.fetchone():
-                            for sid in target_ids:
-                                cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                            conn.commit()
-                            if rows_before > 0:
-                                db_deleted = True
-                    except Exception:
-                        pass
-                    finally:
-                        conn.close()
-                except Exception:
-                    pass
-
-            rows_after = self._count_db_rows_for_ids(state_db, target_ids)
-            if rows_before > 0 and rows_after == 0:
-                db_deleted = True
-            elif rows_after > 0:
-                db_deleted = False
-
-            # 2. Scrub disk files (transcripts and hook outputs)
+            # 1. Zero-fill and unlink confined disk files (transcripts and hook outputs)
+            #    before SessionDB.delete_session removes any remaining session files.
             settings = self.get_settings()
             zero_fill = settings.get("zero_fill_files", True)
             files_scrubbed = 0
@@ -856,29 +871,80 @@ class IncognitoEngine:
                 except Exception as exc:
                     logger.debug("Failed to scrub file %s: %s", file_path, exc)
 
-            if sessions_dir.is_dir():
+            if sessions_dir.is_dir() and not sessions_dir.is_symlink():
+                sessions_root = sessions_dir.resolve()
+                exact_session_names = _session_exact_filenames(target_ids)
                 for p in sessions_dir.iterdir():
-                    if p.is_file() and any(sid in p.name for sid in target_ids):
+                    if (
+                        not p.is_symlink()
+                        and p.is_file()
+                        and p.name in exact_session_names
+                        and p.resolve().parent == sessions_root
+                    ):
                         _scrub_file(p)
 
-            if hook_outputs_dir.is_dir():
+            if hook_outputs_dir.is_dir() and not hook_outputs_dir.is_symlink():
+                hook_root = hook_outputs_dir.resolve()
                 for sid in target_ids:
-                    sid_dir = hook_outputs_dir / sid
+                    if not _is_valid_session_id(sid):
+                        continue
+                    raw_sid_dir = hook_outputs_dir / sid
+                    if raw_sid_dir.is_symlink():
+                        continue
+                    sid_dir = raw_sid_dir.resolve()
+                    if sid_dir.parent != hook_root or sid_dir == hook_root:
+                        continue
                     if sid_dir.is_dir():
                         for p in sid_dir.glob("**/*"):
-                            if p.is_file():
+                            if not p.is_symlink() and p.is_file() and sid_dir in p.resolve().parents:
                                 _scrub_file(p)
                         try:
-                            # Remove directories from inside out
                             for sub in sorted(sid_dir.glob("**/*"), key=lambda x: len(x.parts), reverse=True):
-                                if sub.is_dir():
+                                if not sub.is_symlink() and sub.is_dir() and sid_dir in sub.resolve().parents:
                                     sub.rmdir()
                             sid_dir.rmdir()
                         except Exception:
                             pass
+                exact_hook_names = _hook_exact_filenames(target_ids)
                 for p in hook_outputs_dir.iterdir():
-                    if p.is_file() and any(sid in p.name for sid in target_ids):
+                    if (
+                        not p.is_symlink()
+                        and p.is_file()
+                        and p.name in exact_hook_names
+                        and p.resolve().parent == hook_root
+                    ):
                         _scrub_file(p)
+
+            # 2. Delete state.db rows exclusively through SessionDB.delete_session(...)
+            db_deleted = False
+            delete_deferred = False
+            if SessionDB is not None and state_db.exists():
+                try:
+                    db = SessionDB(db_path=state_db)
+                    try:
+                        for sid in list(target_ids):
+                            try:
+                                if db.delete_session(
+                                    sid,
+                                    sessions_dir=sessions_dir,
+                                    include_compression_chain=True,
+                                ):
+                                    db_deleted = True
+                            except Exception as exc:
+                                delete_deferred = True
+                                logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
+                    finally:
+                        if hasattr(db, "close"):
+                            db.close()
+                except Exception as exc:
+                    delete_deferred = True
+                    logger.debug("SessionDB open failed during burn_session: %s", exc)
+
+            rows_after = self._count_db_rows_for_ids(state_db, target_ids)
+            if rows_before > 0 and rows_after == 0 and not delete_deferred:
+                db_deleted = True
+            elif rows_after > 0 or delete_deferred:
+                db_deleted = False
 
             # 3. Clear RAM vault
             vault_keys_cleared = 0
@@ -890,7 +956,7 @@ class IncognitoEngine:
 
             # 4. Remove active leases, or retain a pending_burn tombstone if Gateway still holds
             #    an active turn admission lock on the sessions row so sweep/retry finishes it.
-            pending_burn = rows_after > 0
+            pending_burn = rows_after > 0 or (delete_deferred and not db_deleted)
             if pending_burn:
                 leases[session_id] = {
                     **(lease if isinstance(lease, dict) else {}),
@@ -1032,6 +1098,13 @@ class IncognitoEngine:
         """Verify zero residual trace across SQLite rows, disk files, and RAM vault."""
         if not session_id:
             raise ValueError("session_id must be a non-empty string")
+        if not _is_valid_session_id(session_id):
+            return {
+                "ok": False,
+                "session_id": session_id,
+                "zero_trace": False,
+                "error": "Invalid session_id format",
+            }
 
         with self._lock:
             db_rows_found = 0
@@ -1055,22 +1128,41 @@ class IncognitoEngine:
                 except Exception:
                     pass
 
-            # Check files
+            # Check files using confined paths and exact filename matches
+            single_target = {session_id}
             session_files_found = 0
             sessions_dir = self.home_dir / "sessions"
-            if sessions_dir.is_dir():
+            if sessions_dir.is_dir() and not sessions_dir.is_symlink():
+                sessions_root = sessions_dir.resolve()
+                exact_session_names = _session_exact_filenames(single_target)
                 for p in sessions_dir.iterdir():
-                    if p.is_file() and session_id in p.name:
+                    if (
+                        not p.is_symlink()
+                        and p.is_file()
+                        and p.name in exact_session_names
+                        and p.resolve().parent == sessions_root
+                    ):
                         session_files_found += 1
 
             hook_files_found = 0
             hook_outputs_dir = self.home_dir / "hook_outputs"
-            if hook_outputs_dir.is_dir():
-                sid_dir = hook_outputs_dir / session_id
-                if sid_dir.is_dir():
-                    hook_files_found += len(list(sid_dir.glob("**/*")))
+            if hook_outputs_dir.is_dir() and not hook_outputs_dir.is_symlink():
+                hook_root = hook_outputs_dir.resolve()
+                raw_sid_dir = hook_outputs_dir / session_id
+                if not raw_sid_dir.is_symlink():
+                    sid_dir = raw_sid_dir.resolve()
+                    if sid_dir.parent == hook_root and sid_dir != hook_root and sid_dir.is_dir():
+                        hook_files_found += sum(
+                            1 for p in sid_dir.glob("**/*") if not p.is_symlink() and sid_dir in p.resolve().parents
+                        )
+                exact_hook_names = _hook_exact_filenames(single_target)
                 for p in hook_outputs_dir.iterdir():
-                    if p.is_file() and session_id in p.name:
+                    if (
+                        not p.is_symlink()
+                        and p.is_file()
+                        and p.name in exact_hook_names
+                        and p.resolve().parent == hook_root
+                    ):
                         hook_files_found += 1
 
             ram_vault_entries = len(self._vaults.get(session_id, {}))
@@ -1183,6 +1275,26 @@ class IncognitoEngine:
                 caller_mode = leases.get(session_id, {}).get("mode", "standard")
 
             for t_name, t_args in calls_to_check:
+                if t_name == "incognito_control":
+                    incog_action = str(t_args.get("action") or "status").strip().lower()
+                    incog_disable = str(
+                        t_args.get("disable_action") or ("keep" if t_args.get("keep", True) else "burn")
+                    ).strip().lower()
+                    if incog_action == "burn" or (
+                        incog_action in ("disable", "off") and incog_disable == "burn"
+                    ):
+                        if not is_caller_incog:
+                            return {
+                                "action": "block",
+                                "message": "Refusing to burn: active session is not in incognito mode.",
+                            }
+                        return {
+                            "action": "approve",
+                            "message": (
+                                f"Confirm permanently burning active incognito session '{session_id}'?"
+                            ),
+                        }
+
                 if t_name == "session_search":
                     target_sid = t_args.get("session_id")
                     if isinstance(target_sid, str) and target_sid in protected_ids:

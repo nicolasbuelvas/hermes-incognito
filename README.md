@@ -146,8 +146,8 @@ When used with Hermes Desktop, Incognito provides native integration:
 
 When an incognito session is burned or expires via idle TTL, the scrubbing engine guarantees complete elimination of local residue:
 
-1. **Database Scrubbing:** Executes `DELETE FROM sessions WHERE id = ?` and `DELETE FROM messages WHERE session_id = ?` against local `state.db`.
-2. **File Overwrite & Unlink:** Locates JSONL transcripts in `$HERMES_HOME/sessions/` and temporary artifacts in `$HERMES_HOME/hook_outputs/`. Overwrites every byte with zero blocks before calling file unlink.
+1. **Database Scrubbing:** Removes incognito session and compression-chain rows (including FTS5 index entries) via `SessionDB.delete_session(..., include_compression_chain=True)`, retaining a pending-burn tombstone for deferred retry if an active turn guard is still settling.
+2. **File Overwrite & Unlink:** Locates exact session files in `$HERMES_HOME/sessions/` and confined per-session spill directories/files in `$HERMES_HOME/hook_outputs/`. Overwrites every byte with zero blocks before calling file unlink.
 3. **Vault Depletion:** Discards in-memory encryption keys and reversible PII mapping tables.
 4. **Audit Receipt:** Emits a content-free cryptographic receipt containing timestamp, verification checksum, and counts of cleared artifacts.
 
