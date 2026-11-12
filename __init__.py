@@ -543,6 +543,29 @@ def register(ctx: Any) -> None:
                 engine.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
             return engine.status_summary("")
 
+        def rpc_enable(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+            p = params or {}
+            sid = str(p.get("session_id") or session_id or "").strip()
+            mode = str(p.get("mode") or "standard").strip().lower()
+            if not sid:
+                return {"ok": False, "error": "session_id required"}
+            if mode not in ("standard", "strict"):
+                return {"ok": False, "error": "mode must be 'standard' or 'strict'"}
+            ttl = p.get("ttl_minutes")
+            redact = p.get("redact_pii")
+            result = engine.enable_session(
+                sid, mode=mode, ttl_minutes=int(ttl) if ttl is not None else None,
+                redact_pii=None if redact is None else bool(redact),
+            )
+            return {**engine.status_summary(sid), "ok": True} if result.get("ok") else result
+
+        def rpc_disable(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+            sid = str((params or {}).get("session_id") or session_id or "").strip()
+            if not sid or not engine.is_incognito(sid):
+                return {"ok": False, "error": "This chat is not in Incognito."}
+            result = engine.disable_session(sid, action="keep")
+            return {**engine.status_summary(sid), "ok": True} if result.get("ok") else result
+
         def rpc_arm(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
             p = params or {}
             if p.get("disarm"):
@@ -569,6 +592,8 @@ def register(ctx: Any) -> None:
         try:
             ctx.register_rpc("status", rpc_status)
             ctx.register_rpc("toggle", rpc_toggle)
+            ctx.register_rpc("enable", rpc_enable)
+            ctx.register_rpc("disable", rpc_disable)
             ctx.register_rpc("arm", rpc_arm)
             ctx.register_rpc("burn", rpc_burn)
             ctx.register_rpc("sweep", rpc_sweep)
