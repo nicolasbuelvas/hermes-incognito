@@ -103,11 +103,6 @@ INCOGNITO_CONTROL_SCHEMA: dict[str, Any] = {
                 ),
                 "default": "standard",
             },
-            "session_id": {
-                "type": "string",
-                "description": "Target session ID. Defaults to the active session.",
-                "default": "",
-            },
             "ttl_minutes": {
                 "type": "integer",
                 "description": "Idle inactivity timeout in minutes before orphan sweeps purge the session (0 disables).",

@@ -174,12 +174,30 @@ def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env):
     spill_file = spill_dir / "spill.txt"
     spill_file.write_text("sensitive hook spill content", encoding="utf-8")
 
-    # Insert into mock db
+    # Insert into db via SessionDB when available, else SQLite fallback
     db_path = tmp_path / "state.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (sess_id, "Secret chat"))
-        conn.execute("INSERT OR REPLACE INTO messages (id, session_id, content) VALUES (?, ?, ?)", ("m1", sess_id, "Secret msg"))
-        conn.commit()
+    if engine.SessionDB is not None:
+        sdb = engine.SessionDB(db_path=db_path)
+        try:
+            if hasattr(sdb, "create_session"):
+                sdb.create_session(sess_id, source="cli", model="gpt-4")
+            if hasattr(sdb, "append_message"):
+                sdb.append_message(sess_id, role="user", content="Secret msg")
+            else:
+                with sqlite3.connect(str(db_path)) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO messages (id, session_id, content) VALUES (?, ?, ?)",
+                        ("m1", sess_id, "Secret msg"),
+                    )
+                    conn.commit()
+        finally:
+            if hasattr(sdb, "close"):
+                sdb.close()
+    else:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (sess_id, "Secret chat"))
+            conn.execute("INSERT OR REPLACE INTO messages (id, session_id, content) VALUES (?, ?, ?)", ("m1", sess_id, "Secret msg"))
+            conn.commit()
 
     eng.enable_session(sess_id, mode="strict")
     if hasattr(eng, "store_vault_entry"):
@@ -202,8 +220,143 @@ def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env):
         cursor = conn.cursor()
         cursor.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,))
         assert cursor.fetchone()[0] == 0
-        cursor.execute("SELECT count(*) FROM messages WHERE id = ?", (sess_id,))
+        cursor.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,))
         assert cursor.fetchone()[0] == 0
+
+
+def test_burn_session_refuses_non_incognito_and_unsafe_session_ids(isolated_hermes_env):
+    """
+    burn_session must:
+      1) Refuse any session_id that has neither an incognito lease nor model_config.incognito tag,
+         leaving non-incognito DB rows and transcript files completely untouched.
+      2) Refuse unsafe session_ids containing '/', '\\', '..', or absolute paths.
+      3) Allow burning an orphaned session tagged with model_config.incognito in SessionDB even
+         when leases.json has no entry for it.
+    """
+    tmp_path = isolated_hermes_env["home"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+    db_path = tmp_path / "state.db"
+
+    # 1. Normal non-incognito session must NOT be burned
+    normal_sid = "sess-normal-untouched"
+    normal_file = isolated_hermes_env["sessions_dir"] / f"{normal_sid}.jsonl"
+    normal_file.write_text('{"role": "user", "content": "important permanent chat"}\n', encoding="utf-8")
+    if engine.SessionDB is not None:
+        real_db = engine.SessionDB(db_path=db_path)
+        try:
+            real_db.create_session(normal_sid, source="cli", model="gpt-4")
+        finally:
+            real_db.close()
+    else:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (normal_sid, "Permanent"))
+            conn.commit()
+
+    refused_normal = eng.burn_session(normal_sid, reason="unauthorized_attempt")
+    assert refused_normal["ok"] is False
+    assert normal_file.exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (normal_sid,)).fetchone()[0] == 1
+
+    # 2. Unsafe path-traversal or absolute session_ids must be refused
+    for bad_id in ("../sessions", "..\\sessions", "foo/bar", "foo\\bar", "a..b", "/abs/path", "C:\\abs\\path"):
+        res_bad = eng.burn_session(bad_id, reason="traversal_attempt")
+        assert res_bad["ok"] is False
+
+    # 3. Session tagged via model_config.incognito in SessionDB (without lease in leases.json) CAN be burned
+    if engine.SessionDB is not None:
+        tagged_sid = "sess-db-tagged-incog"
+        tagged_file = isolated_hermes_env["sessions_dir"] / f"{tagged_sid}.jsonl"
+        tagged_file.write_text('{"role": "user", "content": "orphaned incog"}\n', encoding="utf-8")
+        real_db = engine.SessionDB(db_path=db_path)
+        try:
+            real_db.create_session(tagged_sid, source="cli", model="gpt-4")
+            real_db.patch_session_model_config(tagged_sid, {"incognito": {"mode": "strict"}})
+        finally:
+            real_db.close()
+
+        burned_tagged = eng.burn_session(tagged_sid, reason="orphan_cleanup")
+        assert burned_tagged["ok"] is True
+        assert not tagged_file.exists()
+        with sqlite3.connect(str(db_path)) as conn:
+            assert conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (tagged_sid,)).fetchone()[0] == 0
+
+
+def test_burn_and_verify_confine_hook_outputs_and_use_exact_filenames(isolated_hermes_env):
+    """
+    burn_session and verify_zero_trace must:
+      1) Use exact filename matches in sessions/ and hook_outputs/ so prefix/substring neighbors
+         (e.g. 'sessions.json', 'sess-10.jsonl', 'sess-10.txt') are NEVER touched or flagged.
+      2) Confine sid_dir deletion so resolved sid_dir must be a direct child of hook_outputs_dir.resolve()
+         (refusing symlink escapes outside hook_outputs_dir).
+    """
+    tmp_path = isolated_hermes_env["home"]
+    sessions_dir = isolated_hermes_env["sessions_dir"]
+    hook_outputs_dir = isolated_hermes_env["hook_outputs_dir"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+
+    # Session ID 'sess-1' is a prefix substring of 'sess-10' and 'session' is a substring of 'sessions.json'
+    target_sid = "session"
+    neighbor_sid = "session-keep"
+
+    gateway_index = sessions_dir / "sessions.json"
+    gateway_index.write_text('{"telegram:123": "session-keep"}', encoding="utf-8")
+    neighbor_transcript = sessions_dir / f"{neighbor_sid}.jsonl"
+    neighbor_transcript.write_text('{"role": "user", "content": "neighbor"}\n', encoding="utf-8")
+    neighbor_hook_file = hook_outputs_dir / f"{neighbor_sid}.txt"
+    neighbor_hook_file.write_text("neighbor hook output", encoding="utf-8")
+
+    own_transcript = sessions_dir / f"{target_sid}.jsonl"
+    own_transcript.write_text('{"role": "user", "content": "secret"}\n', encoding="utf-8")
+    own_hook_dir = hook_outputs_dir / target_sid
+    own_hook_dir.mkdir(parents=True, exist_ok=True)
+    own_spill = own_hook_dir / "spill1.txt"
+    own_spill.write_text("secret spill", encoding="utf-8")
+    own_hook_flat = hook_outputs_dir / f"{target_sid}.txt"
+    own_hook_flat.write_text("flat spill", encoding="utf-8")
+
+    eng.enable_session(target_sid, mode="strict")
+    res = eng.burn_session(target_sid, reason="burn")
+    assert res["ok"] is True
+
+    # Own files deleted
+    assert not own_transcript.exists()
+    assert not own_spill.exists()
+    assert not own_hook_dir.exists()
+    assert not own_hook_flat.exists()
+
+    # Substring neighbor files and sessions.json MUST survive untouched
+    assert gateway_index.exists()
+    assert neighbor_transcript.exists()
+    assert neighbor_hook_file.exists()
+
+    # verify_zero_trace on target_sid must report zero_trace=True despite substring neighbors existing
+    verified = eng.verify_zero_trace(target_sid)
+    assert verified["zero_trace"] is True
+    assert verified["session_files_found"] == 0
+    assert verified["hook_files_found"] == 0
+
+    # If a symlink or junctions in hook_outputs/<sid> resolves outside hook_outputs_dir, do not delete outside target
+    outside_dir = tmp_path / "outside_protected_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "must_survive.txt"
+    outside_file.write_text("critical host data", encoding="utf-8")
+
+    symlink_sid = "sess-symlink-escape"
+    link_path = hook_outputs_dir / symlink_sid
+    symlink_created = False
+    try:
+        link_path.symlink_to(outside_dir, target_is_directory=True)
+        symlink_created = True
+    except OSError:
+        pass
+
+    if symlink_created:
+        eng.enable_session(symlink_sid, mode="standard")
+        eng.burn_session(symlink_sid, reason="burn")
+        assert outside_file.exists()
+
+
 
 
 def test_engine_verify_zero_trace(isolated_hermes_env):
@@ -298,63 +451,82 @@ def test_engine_concurrency(isolated_hermes_env):
     assert not errors, f"Concurrency errors occurred: {errors}"
 
 
-def test_engine_burn_busy_session_purges_messages_and_defers_session_row(isolated_hermes_env, monkeypatch):
+def test_engine_burn_deletes_only_via_sessiondb_and_retries_deferred_burn(isolated_hermes_env, monkeypatch):
     """
-    Regression test for Gateway runtime race: when SQLite's sessions_runtime_ledger_delete_guard
-    blocks DELETE FROM sessions while a turn admission is still settling, burn_session must:
-      1) Immediately purge all rows from messages (wiping FTS/content right away).
-      2) Retain a pending_burn tombstone in leases (keeping get_protected_session_ids() active).
-      3) Complete full zero-trace deletion on the next sweep_expired() once the guard clears.
+    burn_session must delete state.db rows exclusively via SessionDB.delete_session(...)
+    (zero raw sqlite3 DELETE statements in engine.py), retaining a pending_burn tombstone
+    when SessionDB.delete_session defers and finishing cleanly on retry/sweep.
     """
     if IncognitoEngine is None:
         pytest.skip("IncognitoEngine not yet importable")
 
-    monkeypatch.setattr(engine, "SessionDB", None)
+    engine_source = (PROJECT_ROOT / "engine.py").read_text(encoding="utf-8")
+    assert "DELETE FROM" not in engine_source
+
     tmp_path = isolated_hermes_env["home"]
+    db_path = tmp_path / "state.db"
+    sess_id = "local-busy-admission-chat"
+
+    busy = {"active": True}
+
+    class _GuardedSessionDB:
+        def __init__(self, db_path: Path):
+            self.db_path = Path(db_path)
+
+        def set_session_hidden(self, session_id: str, hidden: bool) -> None:
+            pass
+
+        def patch_session_model_config(self, session_id: str, patch: dict) -> None:
+            pass
+
+        def session_ids_with_model_config_key(self, key: str) -> list[str]:
+            return []
+
+        def get_session_delete_targets(self, session_id: str) -> list[str]:
+            return [session_id]
+
+        def delete_session(
+            self, session_id: str, sessions_dir=None, include_compression_chain: bool = False, **kwargs
+        ) -> bool:
+            if busy["active"]:
+                raise RuntimeError("session_busy")
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+                cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                conn.commit()
+                return cur.rowcount > 0
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(engine, "SessionDB", _GuardedSessionDB)
     eng = IncognitoEngine(home_dir=tmp_path)
     monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
 
-    sess_id = "local-busy-admission-chat"
-    db_path = tmp_path / "state.db"
     with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS admission_guard (session_id TEXT PRIMARY KEY)")
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS guard_busy_session
-            BEFORE DELETE ON sessions
-            WHEN EXISTS (SELECT 1 FROM admission_guard WHERE session_id = old.id)
-            BEGIN
-                SELECT RAISE(ABORT, 'session_busy');
-            END;
-            """
-        )
-        conn.execute("INSERT INTO admission_guard (session_id) VALUES (?)", (sess_id,))
-        conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (sess_id, "Recordar color stiven"))
+        conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (sess_id, "Deferred chat"))
         conn.execute(
             "INSERT OR REPLACE INTO messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-            ("m-secret-1", sess_id, "user", "Mi color favorito es stiven"),
+            ("m-secret-1", sess_id, "user", "Deferred secret payload"),
         )
         conn.commit()
 
     eng.enable_session(sess_id, mode="strict")
     burn_res = eng.burn_session(sess_id, reason="session_finalize")
 
-    # Messages MUST be wiped immediately even though sessions row is temporarily guarded
+    # No raw sqlite3 DELETE bypassed SessionDB while busy; pending_burn keeps session protected
     with sqlite3.connect(str(db_path)) as conn:
         msg_count = conn.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,)).fetchone()[0]
         sess_count = conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,)).fetchone()[0]
-    assert msg_count == 0
+    assert msg_count == 1
     assert sess_count == 1
     assert burn_res["db_deleted"] is False
     assert burn_res["pending_burn"] is True
     assert eng.is_incognito(sess_id) is False
     assert sess_id in eng.get_protected_session_ids()
 
-    # Once Gateway marks admission terminal (guard cleared), sweep_expired completes zero-trace
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("DELETE FROM admission_guard WHERE session_id = ?", (sess_id,))
-        conn.commit()
-
+    # Once SessionDB.delete_session succeeds on retry / sweep_expired, zero-trace completes
+    busy["active"] = False
     eng.sweep_expired()
     verify = eng.verify_zero_trace(sess_id)
     assert verify["zero_trace"] is True

@@ -141,6 +141,8 @@ def burn_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     receipt = None
     if hasattr(eng, "burn_session"):
         receipt = eng.burn_session(session_id, reason="desktop_burn")
+        if isinstance(receipt, dict) and not receipt.get("ok", True):
+            return {"ok": False, "session_id": session_id, "error": receipt.get("error"), "receipt": receipt}
     return {"ok": True, "session_id": session_id, "receipt": receipt}
 
 

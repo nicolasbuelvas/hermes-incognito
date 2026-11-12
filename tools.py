@@ -24,10 +24,10 @@ except (ImportError, ValueError):
     from schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
 
 
-def _resolve_sid(payload: dict[str, Any], kwargs: dict[str, Any]) -> str:
+def _resolve_active_sid(kwargs: dict[str, Any]) -> str:
+    """Resolve only the caller's active runtime session ID (never model-supplied args)."""
     sid = str(
-        payload.get("session_id")
-        or kwargs.get("session_id")
+        kwargs.get("session_id")
         or kwargs.get("conversation_id")
         or kwargs.get("task_id")
         or ""
@@ -44,6 +44,13 @@ def _resolve_sid(payload: dict[str, Any], kwargs: dict[str, Any]) -> str:
     return sid
 
 
+def _resolve_sid(payload: dict[str, Any], kwargs: dict[str, Any]) -> str:
+    sid = str(payload.get("session_id") or "").strip()
+    if sid:
+        return sid
+    return _resolve_active_sid(kwargs)
+
+
 def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> str:
     """Inspect or alter incognito privacy states, arming tokens, and manual burns."""
     try:
@@ -52,11 +59,11 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
             payload.update(args)
         elif isinstance(args, str) and args.strip():
             payload["action"] = args.strip()
-        for k in ("action", "mode", "session_id", "ttl_minutes", "redact_pii", "disable_action", "keep"):
+        for k in ("action", "mode", "ttl_minutes", "redact_pii", "disable_action", "keep"):
             if k in kwargs and k not in payload:
                 payload[k] = kwargs[k]
 
-        sid = _resolve_sid(payload, kwargs)
+        sid = _resolve_active_sid(kwargs)
         engine = get_engine()
         action_clean = str(payload.get("action") or "status").strip().lower()
         mode = str(payload.get("mode") or "standard").strip().lower()
@@ -81,8 +88,8 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
                     session_id=sid, mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
                 )
         elif action_clean in ("disable", "off"):
-            if not sid:
-                result = engine.disarm_next_session()
+            if not sid or not engine.is_incognito(sid):
+                result = {"ok": False, "error": "Active session is not in incognito mode"}
             else:
                 result = engine.disable_session(session_id=sid, action=disable_action)
         elif action_clean == "toggle":
@@ -96,8 +103,8 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
             else:
                 result = engine.toggle_session(session_id=sid, mode=mode, ttl_minutes=ttl_minutes)
         elif action_clean == "burn":
-            if not sid:
-                result = {"ok": False, "error": "session_id is required to burn session"}
+            if not sid or not engine.is_incognito(sid):
+                result = {"ok": False, "error": "Active session is not in incognito mode"}
             else:
                 result = engine.burn_session(session_id=sid, reason="tool_control_burn")
         elif action_clean == "arm":

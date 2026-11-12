@@ -24,7 +24,7 @@ Operational procedures for ephemeral sessions, outbound PII redaction, tool muta
 ## Tools & Commands
 
 ### Tool: `incognito_control`
-Control ephemeral state on the current or target session.
+Control ephemeral state on the active session (model-initiated burns require human confirmation via `pre_tool_call` approval).
 - Engage standard mode:
   `incognito_control(action="enable", mode="standard", ttl_minutes=60)`
 - Engage strict clean-room mode with PII masking:
