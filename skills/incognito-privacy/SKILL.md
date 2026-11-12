@@ -24,7 +24,7 @@ Operational procedures for ephemeral sessions, outbound PII redaction, tool muta
 ## Tools & Commands
 
 ### Tool: `incognito_control`
-Control ephemeral state on the current or target session.
+Control ephemeral state on the current session only. The tool cannot target, burn, or sweep other sessions, and `status` reports only the current session. Use `/incognito burn`, `/incognito sweep`, the CLI, or the Desktop controls to delete sessions.
 - Engage standard mode:
   `incognito_control(action="enable", mode="standard", ttl_minutes=60)`
 - Engage strict clean-room mode with PII masking:
@@ -47,8 +47,10 @@ Run forensic verification on a session ID to confirm zero lingering trace on dis
   - Returns cryptographic receipt ID proving zero residue.
 
 ### Slash Commands
-- `/incognito`: Show status summary and active mode.
+- `/incognito` or `/incognito status`: Show status summary and active mode (never changes the mode).
 - `/incognito on [standard|strict]`: Engage incognito for current chat.
+- `/incognito off`: Disable incognito for the current chat and retain history.
+- `/incognito toggle`: Switch incognito on or off for the current chat.
 - `/incognito arm [standard|strict]`: Arm the next created chat.
 - `/incognito burn`: Immediately overwrite, unlink, and delete current chat.
 - `/incognito sweep`: Purge all expired incognito sessions.

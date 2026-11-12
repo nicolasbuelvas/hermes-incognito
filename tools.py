@@ -65,7 +65,8 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
 
         result: dict[str, Any]
         if action_clean == "status":
-            result = engine.status_summary(session_id=sid)
+            # The model sees only its own session, never other sessions or the host audit.
+            result = engine.status_summary(session_id=sid, include_global=False)
         elif action_clean in ("enable", "on"):
             if not sid:
                 result = engine.arm_next_session(mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii)
@@ -89,7 +90,9 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
             elif mode == "off" and not engine.is_incognito(sid):
                 result = {"ok": False, "error": "The active session must be incognito to disable it."}
             else:
-                result = engine.toggle_session(session_id=sid, mode=mode, ttl_minutes=ttl_minutes)
+                result = engine.toggle_session(
+                    session_id=sid, mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+                )
         elif action_clean == "arm":
             result = engine.arm_next_session(mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii)
         elif action_clean == "disarm":

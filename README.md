@@ -32,7 +32,7 @@ Hermes Incognito operates as an in-process security and privacy layer intercepti
 1. **State Isolation:** Ephemeral sessions are tagged in an isolated, volatile registry and filtered out of standard conversation lists and sidebars.
 2. **Tool Mutation Guard:** Active incognito chats intercept `pre_tool_call`. Attempts to mutate persistent storage (`memory`, `skill_manage`) or inspect historical chats (`session_search`, `cronjob_manage` in strict mode) are blocked with structured explanations returned to the agent.
 3. **RAM-Only Middleware:** In strict mode, user profiles and personal notes are stripped from outbound prompts in RAM before reaching model providers. When PII redaction is enabled, sensitive tokens (emails, phone numbers, identifiers) are replaced with synthetic placeholders and restored transparently upon response streaming.
-4. **Lifecycle & Compaction Tracking:** When context compaction occurs, incognito status, TTL leases, and active RAM vault tables transfer seamlessly to continuation sessions while unlinking compressed history.
+4. **Lifecycle & Compaction Tracking:** When context compaction occurs, incognito status, TTL leases, and active RAM vault tables transfer to the continuation session. The compacted sessions become ancestors: they have no TTL of their own, are never swept or finalized on their own, and are deleted together with the live continuation when it is burned.
 5. **Secure Scrubbing:** Upon chat completion or TTL idle expiration, sessions are burned: associated SQLite database rows are deleted, transcript files are overwritten with zeros and unlinked, hook output caches are removed, and volatile RAM vaults are wiped.
 
 ---
@@ -102,9 +102,10 @@ hermes incognito verify <session_id>
 
 Within any active Hermes conversation:
 
-- `/incognito`: View privacy status, active mode, and metric counters.
+- `/incognito` or `/incognito status`: View privacy status, active mode, and metric counters. It never changes the mode.
 - `/incognito on [standard|strict]`: Transition the current chat into incognito mode.
 - `/incognito off`: Disable incognito mode and retain future conversation history.
+- `/incognito toggle`: Switch incognito mode on or off for the current chat.
 - `/incognito arm [standard|strict]`: Arm the next new draft chat.
 - `/incognito burn`: Immediately scrub, zero-fill, and unlink the active session.
 - `/incognito sweep`: Purge idle or orphaned incognito sessions.
@@ -114,7 +115,7 @@ Within any active Hermes conversation:
 
 The plugin registers two tools for autonomous or user-guided privacy operations:
 
-- **`incognito_control`**: Manages privacy for the active session and arms the next session. Use `/incognito burn`, the CLI, or the Desktop burn control to delete a session.
+- **`incognito_control`**: Manages privacy for the active session and arms the next session. Its `status` reports only the active session. Use `/incognito burn`, the CLI, or the Desktop burn control to delete a session.
   ```json
   {
     "action": "enable",

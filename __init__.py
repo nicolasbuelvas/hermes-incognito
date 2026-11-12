@@ -128,6 +128,10 @@ def register(ctx: Any) -> None:
         if not sid:
             return
         if engine.is_incognito(sid) and engine.get_settings().get("auto_purge_on_exit", True):
+            if engine.live_head_for(sid):
+                # A compacted ancestor ends while its conversation continues in a live head.
+                # It is deleted when that head is burned, never on its own.
+                return
             reason = str(kwargs.get("hook_name") or "session_finalize")
             result = engine.burn_session(sid, reason=reason)
             if result.get("ok") and hasattr(ctx, "emit_to_session"):
@@ -191,7 +195,7 @@ def register(ctx: Any) -> None:
                 except Exception:
                     pass
 
-        if not subcmd:
+        if subcmd == "toggle":
             if sid:
                 res = engine.toggle_session(sid)
                 if not res["ok"]:
@@ -200,10 +204,13 @@ def register(ctx: Any) -> None:
                 if res.get("mode") != "off":
                     return f"Incognito mode enabled ({res.get('mode')}) for session {sid}."
                 return f"Incognito mode disabled for session {sid}. History retained."
+            if engine.get_armed_state():
+                engine.disarm_next_session()
+                return "Disarmed pending next-session token."
             engine.arm_next_session()
             return "Next session armed for incognito (standard mode)."
 
-        if subcmd == "status":
+        if not subcmd or subcmd == "status":
             summary = engine.status_summary(session_id=sid)
             curr = summary.get("current_session")
             if curr and curr.get("pending_burn"):
@@ -312,15 +319,15 @@ def register(ctx: Any) -> None:
             )
 
         return (
-            "Usage: /incognito [on|off|strict|burn|status|sweep|ttl <min>|arm|verify <id>]\n"
+            "Usage: /incognito [status|on|off|toggle|strict|burn|sweep|ttl <min>|arm|verify <id>]\n"
             "Control zero-trace ephemeral session privacy and sanitation."
         )
 
     ctx.register_command(
         name="incognito",
         handler=handle_slash_command,
-        description="Toggle or manage zero-trace incognito mode for this session",
-        args_hint="[on|strict|off|burn|status|sweep|ttl <min>|arm|verify <id>]",
+        description="Show or manage zero-trace incognito mode for this session",
+        args_hint="[status|on|strict|off|toggle|burn|sweep|ttl <min>|arm|verify <id>]",
     )
 
     # Register direct subcommand aliases so TUI/CLI/Desktop '/' autocomplete popup
@@ -528,7 +535,7 @@ def register(ctx: Any) -> None:
             ttl = p.get("ttl_minutes")
             redact = p.get("redact_pii")
             if sid and sid != "new":
-                result = engine.toggle_session(sid, mode=mode, ttl_minutes=ttl)
+                result = engine.toggle_session(sid, mode=mode, ttl_minutes=ttl, redact_pii=redact)
                 return engine.status_summary(sid) if result["ok"] else result
             if mode == "off" or engine.get_armed_state():
                 engine.disarm_next_session()
