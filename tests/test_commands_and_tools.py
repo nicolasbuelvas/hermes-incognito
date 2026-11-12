@@ -84,77 +84,29 @@ def test_tools_dispatch_with_dict_args_and_kwargs(isolated_hermes_env):
     assert status["incognito"] is True
     assert status["mode"] == "strict"
 
-    burned = json.loads(incognito_control({"action": "burn"}, conversation_id="sess-tool-1"))
-    assert burned["ok"] is True
-    assert burned["receipt_id"]
-
     verified = json.loads(incognito_verify({"session_id": "sess-tool-1"}))
     assert verified["ok"] is True
-    assert verified["zero_trace"] is True
-    assert verified["receipt_id"] == burned["receipt_id"]
+    assert verified["zero_trace"] is False
 
 
-def test_incognito_control_burn_and_disable_only_target_active_incognito_and_gate_approval(isolated_hermes_env):
-    """
-    Model-facing incognito_control must:
-      1) Omit session_id from INCOGNITO_CONTROL_SCHEMA and ignore payload['session_id'] on burn/disable.
-      2) Refuse burn and disable unless engine.is_incognito(active_sid) is True.
-      3) Route model-started burns (action='burn' or disable with burn) through pre_tool_call 'approve'.
-    """
-    assert "session_id" not in INCOGNITO_CONTROL_SCHEMA["parameters"]["properties"]
+def test_model_tool_cannot_burn_sweep_or_target_other_sessions():
+    for sid in ("active", "other"):
+        assert json.loads(incognito_control({"action": "enable"}, conversation_id=sid))["ok"]
 
-    ctx = _RecordingCtx()
-    plugin_init.register(ctx)
-    pre_tool = ctx.hooks["pre_tool_call"]
+    for payload in (
+        {"action": "burn"}, {"action": "sweep"}, {"action": "off", "keep": False},
+        {"action": "disable", "disable_action": "burn"},
+    ):
+        payload["session_id"] = "other"
+        assert not json.loads(incognito_control(payload, conversation_id="active"))["ok"]
 
-    # Victim incognito session exists on host, while caller is a different non-incognito session
-    incognito_control({"action": "enable", "mode": "strict"}, conversation_id="sess-victim-incog")
-
-    # Attempt cross-session burn via payload['session_id'] from non-incognito caller -> refused & victim intact
-    cross_burn = json.loads(
-        incognito_control(
-            {"action": "burn", "session_id": "sess-victim-incog"},
-            conversation_id="sess-normal-caller",
-        )
-    )
-    assert cross_burn["ok"] is False
-    cross_disable = json.loads(
-        incognito_control(
-            {"action": "disable", "disable_action": "burn", "session_id": "sess-victim-incog"},
-            conversation_id="sess-normal-caller",
-        )
-    )
-    assert cross_disable["ok"] is False
-
-    victim_status = json.loads(incognito_control({"action": "status"}, conversation_id="sess-victim-incog"))
-    assert victim_status["incognito"] is True
-
-    # pre_tool_call blocks model-started burn from non-incognito session
-    guard_non_incog = pre_tool("incognito_control", {"action": "burn"}, session_id="sess-normal-caller")
-    assert guard_non_incog is not None
-    assert guard_non_incog["action"] == "block"
-
-    # pre_tool_call requires human approval ('approve') for model-started burn on active incognito session
-    guard_incog_burn = pre_tool("incognito_control", {"action": "burn"}, session_id="sess-victim-incog")
-    assert guard_incog_burn is not None
-    assert guard_incog_burn["action"] == "approve"
-
-    guard_incog_disable_burn = pre_tool(
-        "incognito_control",
-        {"action": "disable", "keep": False},
-        session_id="sess-victim-incog",
-    )
-    assert guard_incog_disable_burn is not None
-    assert guard_incog_disable_burn["action"] == "approve"
-
-    guard_wrapped_burn = pre_tool(
-        "tool_call",
-        {"calls": [{"name": "incognito_control", "arguments": {"action": "burn"}}]},
-        session_id="sess-victim-incog",
-    )
-    assert guard_wrapped_burn is not None
-    assert guard_wrapped_burn["action"] == "approve"
-
+    disabled = json.loads(incognito_control(
+        {"action": "disable", "session_id": "other"}, conversation_id="active"
+    ))
+    assert disabled["ok"]
+    assert disabled["session_id"] == "active"
+    assert not json.loads(incognito_control({"action": "disable"}, conversation_id="active"))["ok"]
+    assert json.loads(incognito_control({"action": "status"}, conversation_id="other"))["incognito"]
 
 
 def test_slash_cli_rpc_and_rest_api_end_to_end(isolated_hermes_env, capsys):

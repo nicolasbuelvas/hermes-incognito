@@ -55,6 +55,30 @@ async function callBackend(ctx, action, payload = {}) {
   return null
 }
 
+async function toggleFromDesktop(ctx, sessionId, mode) {
+  const result = await callBackend(ctx, 'toggle', { session_id: sessionId, mode })
+  if (!result?.ok) {
+    host.notify({ kind: 'warning', message: result?.error || 'Unable to change incognito mode' })
+    return null
+  }
+  notifyStateListeners()
+  return result
+}
+
+async function burnFromDesktop(ctx, sessionId) {
+  const response = await callBackend(ctx, 'burn', { session_id: sessionId })
+  const result = response?.receipt || response
+  if (!result?.ok) {
+    host.notify({ kind: 'warning', message: result?.error || 'Unable to burn this session' })
+    return
+  }
+  notifyStateListeners()
+  host.notify({
+    kind: 'warning',
+    message: result.pending_burn ? 'Burn pending. Hermes will retry cleanup.' : 'Session burned'
+  })
+}
+
 function NoticeBanner() {
   return jsx('div', {
     style: {
@@ -169,8 +193,7 @@ function ComposerPrivacyBanner({ ctx }) {
                 variant: 'outline',
                 onClick: async () => {
                   const nextMode = isStrict ? 'standard' : 'strict'
-                  await callBackend(ctx, 'toggle', { session_id: focusedSessionId, mode: nextMode })
-                  notifyStateListeners()
+                  if (!await toggleFromDesktop(ctx, focusedSessionId, nextMode)) return
                   host.notify({ kind: 'info', message: `Switched to ${nextMode} mode` })
                 },
                 children: isStrict ? 'Switch Standard' : 'Switch Strict'
@@ -179,8 +202,7 @@ function ComposerPrivacyBanner({ ctx }) {
                 size: 'sm',
                 variant: 'ghost',
                 onClick: async () => {
-                  await callBackend(ctx, 'toggle', { session_id: focusedSessionId, mode: 'off' })
-                  notifyStateListeners()
+                  if (!await toggleFromDesktop(ctx, focusedSessionId, 'off')) return
                   host.notify({ kind: 'info', message: 'Incognito disabled (retained session)' })
                 },
                 children: 'Keep & Exit'
@@ -189,9 +211,7 @@ function ComposerPrivacyBanner({ ctx }) {
                 size: 'sm',
                 variant: 'destructive',
                 onClick: async () => {
-                  await callBackend(ctx, 'burn', { session_id: focusedSessionId })
-                  notifyStateListeners()
-                  host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+                  await burnFromDesktop(ctx, focusedSessionId)
                 },
                 children: 'Burn Now'
               })
@@ -236,11 +256,8 @@ function StatusbarIndicator({ ctx }) {
   }
 
   const handleClick = async () => {
-    const res = await callBackend(ctx, 'toggle', {
-      session_id: focusedSessionId,
-      mode: 'standard'
-    })
-    notifyStateListeners()
+    const res = await toggleFromDesktop(ctx, focusedSessionId, 'standard')
+    if (!res) return
     const active = res?.incognito || res?.armed
     host.notify({
       kind: 'info',
@@ -417,8 +434,7 @@ function PrivacyControlCenter({ ctx }) {
                     size: 'sm',
                     variant: isIncognito && mode === 'standard' ? 'outline' : 'default',
                     onClick: async () => {
-                      await callBackend(ctx, 'toggle', { session_id: focusedSessionId, mode: 'standard' })
-                      notifyStateListeners()
+                      if (!await toggleFromDesktop(ctx, focusedSessionId, 'standard')) return
                       host.notify({ kind: 'info', message: 'Standard Incognito engaged' })
                     },
                     children: 'Engage Standard'
@@ -427,8 +443,7 @@ function PrivacyControlCenter({ ctx }) {
                     size: 'sm',
                     variant: isIncognito && mode === 'strict' ? 'outline' : 'default',
                     onClick: async () => {
-                      await callBackend(ctx, 'toggle', { session_id: focusedSessionId, mode: 'strict' })
-                      notifyStateListeners()
+                      if (!await toggleFromDesktop(ctx, focusedSessionId, 'strict')) return
                       host.notify({ kind: 'info', message: 'Strict Clean-Room engaged' })
                     },
                     children: 'Engage Strict'
@@ -439,9 +454,7 @@ function PrivacyControlCenter({ ctx }) {
                     disabled: !focusedSessionId,
                     onClick: async () => {
                       if (!focusedSessionId) return
-                      await callBackend(ctx, 'burn', { session_id: focusedSessionId })
-                      notifyStateListeners()
-                      host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+                      await burnFromDesktop(ctx, focusedSessionId)
                     },
                     children: 'Burn Session'
                   })
@@ -780,8 +793,7 @@ export default {
           defaults: ['mod+shift+i'],
           run: async () => {
             const sid = host?.state?.focusedSessionId?.get?.() || ''
-            await callBackend(ctx, 'toggle', { session_id: sid, mode: 'standard' })
-            notifyStateListeners()
+            if (!await toggleFromDesktop(ctx, sid, 'standard')) return
             host.notify({ kind: 'info', message: 'Toggled Incognito mode' })
           }
         }
@@ -795,8 +807,7 @@ export default {
           keywords: ['incognito', 'privacy', 'ephemeral', 'toggle'],
           run: async () => {
             const sid = host?.state?.focusedSessionId?.get?.() || ''
-            await callBackend(ctx, 'toggle', { session_id: sid, mode: 'standard' })
-            notifyStateListeners()
+            if (!await toggleFromDesktop(ctx, sid, 'standard')) return
             host.notify({ kind: 'info', message: 'Toggled Incognito mode' })
           }
         }
@@ -810,8 +821,7 @@ export default {
           keywords: ['incognito', 'strict', 'clean-room', 'privacy'],
           run: async () => {
             const sid = host?.state?.focusedSessionId?.get?.() || ''
-            await callBackend(ctx, 'toggle', { session_id: sid, mode: 'strict' })
-            notifyStateListeners()
+            if (!await toggleFromDesktop(ctx, sid, 'strict')) return
             host.notify({ kind: 'info', message: 'Strict Clean-Room mode enabled' })
           }
         }
@@ -843,9 +853,7 @@ export default {
               host.notify({ kind: 'warning', message: 'No active session to burn' })
               return
             }
-            await callBackend(ctx, 'burn', { session_id: sid })
-            notifyStateListeners()
-            host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+            await burnFromDesktop(ctx, sid)
           }
         }
       },

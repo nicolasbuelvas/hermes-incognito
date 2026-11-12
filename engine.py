@@ -13,10 +13,11 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 # Allowed Hermes public API imports with fallbacks for standalone/pytest environments
 try:
@@ -107,37 +108,47 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 VALID_MODES: tuple[str, ...] = ("off", "standard", "strict")
-_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_REQUEST_DUMP = re.compile(r"request_dump_(.+)_[0-9]{8}_[0-9]{6}_[0-9]{6}\.json")
 
 
-def _is_valid_session_id(session_id: Any) -> bool:
-    """Validate session_id against a strict filename-safe pattern (no '/', '\\', '..', or roots)."""
-    if not isinstance(session_id, str) or not session_id or len(session_id) > 256:
-        return False
-    if "/" in session_id or "\\" in session_id or ".." in session_id or "\x00" in session_id:
-        return False
-    p = Path(session_id)
-    if p.is_absolute() or p.drive or p.root or p.name != session_id:
-        return False
-    return bool(_SAFE_SESSION_ID_RE.fullmatch(session_id))
+def _valid_session_id(session_id: str) -> bool:
+    return isinstance(session_id, str) and _SESSION_ID.fullmatch(session_id) is not None
 
 
-def _session_exact_filenames(target_ids: set[str]) -> set[str]:
-    """Exact transcript/snapshot filenames for target session IDs in $HERMES_HOME/sessions/."""
-    names: set[str] = set()
-    for sid in target_ids:
-        if _is_valid_session_id(sid):
-            names.update((f"{sid}.jsonl", f"{sid}.json", f"session_{sid}.json", f"session_{sid}.jsonl"))
-    return names
+def _is_incognito_marker(marker: Any) -> bool:
+    return isinstance(marker, dict) or marker is True
 
 
-def _hook_exact_filenames(target_ids: set[str]) -> set[str]:
-    """Exact flat hook-output filenames for target session IDs in $HERMES_HOME/hook_outputs/."""
-    names: set[str] = set()
-    for sid in target_ids:
-        if _is_valid_session_id(sid):
-            names.update((f"{sid}.txt", f"{sid}.json", f"{sid}.jsonl"))
-    return names
+def _session_files(directory: Path, session_id: str) -> Iterator[Path]:
+    names = {f"{session_id}.json", f"{session_id}.jsonl", f"session_{session_id}.json"}
+    if directory.is_dir():
+        for path in directory.iterdir():
+            dump = _REQUEST_DUMP.fullmatch(path.name)
+            if path.name in names or (dump and dump[1] == session_id):
+                yield path
+
+
+def _hook_session_dir(directory: Path, session_id: str) -> Path | None:
+    root = directory.resolve()
+    child = root / session_id
+    # Reject aliases even when they point to a different child of the same root.
+    try:
+        if not child.is_symlink() and child.is_dir() and child.resolve().parts == child.parts:
+            return child
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
+def _flat_hook_files(directory: Path, session_id: str) -> Iterator[Path]:
+    names = {f"{session_id}.txt", f"{session_id}.json", f"{session_id}.jsonl"}
+    if directory.is_dir():
+        for path in directory.iterdir():
+            if path.name in names and (path.is_file() or path.is_symlink()):
+                yield path
+
 
 # Common PII and credential patterns for in-RAM reversible vault
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -148,12 +159,6 @@ _BEARER_PATTERN = re.compile(r"\bBearer\s+([A-Za-z0-9_\-\.~+/=]{20,})\b")
 _SECRET_ASSIGN_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|private[_-]?key)\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.~+/=]{16,})[\"']?"
 )
-
-# Strict clean-room memory stripping patterns
-_STRICT_MEMORY_BLOCKS = re.compile(
-    r"(?is)(?:MEMORY|USER PROFILE)\s*\([^)]*\):?.*?(?=\n\n|\Z)|#{1,3}\s*(?:MEMORY|USER PROFILE)\b.*?(?=\n#{1,3}\s|\Z)"
-)
-
 
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive without using os.kill(pid, 0) on Windows."""
@@ -169,8 +174,14 @@ def _is_pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            # The PID exists but belongs to another user; it is still alive.
+            return True
+        except OSError:
+            # Unknown state: never let the sweeper burn a session that may still be live.
+            return True
     else:
         try:
             import ctypes
@@ -183,6 +194,24 @@ def _is_pid_alive(pid: int) -> bool:
             return False
         except Exception:
             return True
+
+
+def _is_ancestor_lease(lease: Any) -> bool:
+    """A compacted session whose conversation continues in a newer head session."""
+    return isinstance(lease, dict) and bool(lease.get("compacted_into"))
+
+
+def _live_head_for(leases: dict[str, Any], session_id: str) -> str | None:
+    """Return the non-ancestor lease that lists session_id as one of its ancestors."""
+    for sid, lease in leases.items():
+        if (
+            sid != session_id
+            and isinstance(lease, dict)
+            and not _is_ancestor_lease(lease)
+            and session_id in (lease.get("lineage_ids") or [])
+        ):
+            return sid
+    return None
 
 
 class IncognitoEngine:
@@ -389,7 +418,7 @@ class IncognitoEngine:
 
     def consume_armed_session(self, session_id: str) -> dict[str, Any] | None:
         """Activate incognito mode for session_id if armed or default_mode is active."""
-        if not session_id:
+        if not _valid_session_id(session_id):
             return None
         with self._lock:
             leases = self._read_leases()
@@ -430,34 +459,58 @@ class IncognitoEngine:
         ttl_minutes: int | None = None,
         redact_pii: bool | None = None,
     ) -> dict[str, Any]:
-        """Enable incognito mode for a session, hiding it in SQLite and registering lease."""
-        if not session_id or not isinstance(session_id, str):
-            raise ValueError("session_id must be a non-empty string")
-        if not _is_valid_session_id(session_id):
-            raise ValueError("Invalid session_id format")
+        """Enable incognito mode for a session, hiding it in SQLite and registering lease.
+
+        An existing lease is updated in place so a mode switch or re-enable keeps its
+        lineage, counters, start time, and redaction choice. TTL and redaction change
+        only when passed explicitly.
+        """
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
         if mode not in ("standard", "strict"):
             raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
 
         with self._lock:
+            leases = self._read_leases()
+            existing = leases.get(session_id)
+            if isinstance(existing, dict) and existing.get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
             settings = self.get_settings()
-            ttl = ttl_minutes if ttl_minutes is not None else settings.get("default_ttl_minutes", 60)
-            redact = redact_pii if redact_pii is not None else settings.get("redact_outbound_pii", False)
             now = time.time()
-            expires_at = now + (ttl * 60) if ttl > 0 else None
 
-            lease = {
-                "session_id": session_id,
-                "mode": mode,
-                "ttl_minutes": ttl,
-                "owner_pid": os.getpid(),
-                "started_at": now,
-                "last_activity": now,
-                "expires_at": expires_at,
-                "redact_pii": redact,
-                "blocked_writes": 0,
-                "redactions": 0,
-                "lineage_ids": [session_id],
-            }
+            if isinstance(existing, dict):
+                lease = dict(existing)
+                lease["session_id"] = session_id
+                lease["mode"] = mode
+                lease["last_activity"] = now
+                if redact_pii is not None:
+                    lease["redact_pii"] = bool(redact_pii)
+                if ttl_minutes is not None:
+                    lease["ttl_minutes"] = int(ttl_minutes)
+                lineage = lease.get("lineage_ids")
+                if not isinstance(lineage, list) or session_id not in lineage:
+                    lease["lineage_ids"] = sorted(set((lineage if isinstance(lineage, list) else []) + [session_id]))
+                ttl = lease.get("ttl_minutes", 0) or 0
+                if not _is_ancestor_lease(lease):
+                    lease["expires_at"] = now + (ttl * 60) if ttl > 0 else None
+                newly_protected = False
+            else:
+                ttl = ttl_minutes if ttl_minutes is not None else settings.get("default_ttl_minutes", 60)
+                redact = redact_pii if redact_pii is not None else settings.get("redact_outbound_pii", False)
+                lease = {
+                    "session_id": session_id,
+                    "mode": mode,
+                    "ttl_minutes": ttl,
+                    "owner_pid": os.getpid(),
+                    "started_at": now,
+                    "last_activity": now,
+                    "expires_at": now + (ttl * 60) if ttl > 0 else None,
+                    "redact_pii": redact,
+                    "blocked_writes": 0,
+                    "redactions": 0,
+                    "lineage_ids": [session_id],
+                }
+                newly_protected = True
 
             # Update SessionDB if available
             state_db = self.home_dir / "state.db"
@@ -473,13 +526,13 @@ class IncognitoEngine:
                 except Exception:
                     pass
 
-            leases = self._read_leases()
             leases[session_id] = lease
             self._write_leases(leases)
 
-            audit = self._read_audit()
-            audit["sessions_protected"] = audit.get("sessions_protected", 0) + 1
-            self._write_audit(audit)
+            if newly_protected:
+                audit = self._read_audit()
+                audit["sessions_protected"] = audit.get("sessions_protected", 0) + 1
+                self._write_audit(audit)
 
             return {"ok": True, "session_id": session_id, "mode": mode, "lease": lease}
 
@@ -488,49 +541,71 @@ class IncognitoEngine:
     # -------------------------------------------------------------------------
 
     def disable_session(self, session_id: str, action: str = "keep") -> dict[str, Any]:
-        """Disable incognito mode, keeping or immediately burning residual state."""
-        if not session_id:
-            raise ValueError("session_id must be a non-empty string")
+        """Disable incognito mode, keeping or immediately burning residual state.
+
+        Keeping a compacted head also releases its ancestor segments, so the retained
+        conversation is not swept later as orphaned incognito history.
+        """
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
 
         if action == "burn":
             return self.burn_session(session_id, reason="disable_burn")
 
         with self._lock:
+            leases = self._read_leases()
+            lease = leases.get(session_id)
+            if isinstance(lease, dict) and lease.get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
+            released = [session_id]
+            if isinstance(lease, dict) and not _is_ancestor_lease(lease):
+                released += [
+                    sid for sid in lease.get("lineage_ids", [])
+                    if sid != session_id
+                    and _is_ancestor_lease(leases.get(sid))
+                    and not leases[sid].get("pending_burn")
+                ]
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
                     db = SessionDB(db_path=state_db)
                     try:
-                        db.set_session_hidden(session_id, False)
-                        db.patch_session_model_config(session_id, {"incognito": None})
+                        for sid in released:
+                            db.set_session_hidden(sid, False)
+                            db.patch_session_model_config(sid, {"incognito": None})
                     finally:
                         if hasattr(db, "close"):
                             db.close()
                 except Exception:
                     pass
 
-            leases = self._read_leases()
-            leases.pop(session_id, None)
+            for sid in released:
+                leases.pop(sid, None)
+                # Clear in-RAM vaults
+                self._vaults.pop(sid, None)
+                self._reverse_vaults.pop(sid, None)
+                self._kind_counters.pop(sid, None)
             self._write_leases(leases)
-
-            # Clear in-RAM vaults
-            self._vaults.pop(session_id, None)
-            self._reverse_vaults.pop(session_id, None)
-            self._kind_counters.pop(session_id, None)
 
             return {"ok": True, "session_id": session_id, "mode": "off", "action": "keep"}
 
     def set_session_ttl(self, session_id: str, ttl_minutes: int) -> dict[str, Any]:
         """Update inactivity TTL in minutes for an active incognito session."""
-        if not session_id:
-            return {"ok": False, "error": "session_id is required"}
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
         with self._lock:
             leases = self._read_leases()
             if session_id not in leases:
                 return {"ok": False, "error": f"Session '{session_id}' is not currently incognito"}
+            if leases[session_id].get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
             leases[session_id]["ttl_minutes"] = int(ttl_minutes)
             now = time.time()
-            leases[session_id]["expires_at"] = now + (int(ttl_minutes) * 60) if int(ttl_minutes) > 0 else None
+            if not _is_ancestor_lease(leases[session_id]):
+                # Ancestors have no deadline of their own; they burn with their head.
+                leases[session_id]["expires_at"] = (
+                    now + (int(ttl_minutes) * 60) if int(ttl_minutes) > 0 else None
+                )
             self._write_leases(leases)
             return {
                 "ok": True,
@@ -544,7 +619,11 @@ class IncognitoEngine:
     # -------------------------------------------------------------------------
 
     def toggle_session(
-        self, session_id: str, mode: str = "standard", ttl_minutes: int | None = None
+        self,
+        session_id: str,
+        mode: str = "standard",
+        ttl_minutes: int | None = None,
+        redact_pii: bool | None = None,
     ) -> dict[str, Any]:
         """Toggle incognito mode, disable when mode=='off', or switch mode in place."""
         clean_mode = (mode or "standard").strip().lower()
@@ -553,22 +632,25 @@ class IncognitoEngine:
         if self.is_incognito(session_id):
             current = self.get_session_state(session_id)
             if current and current.get("mode") != clean_mode and clean_mode in ("standard", "strict"):
-                return self.enable_session(session_id, mode=clean_mode, ttl_minutes=ttl_minutes)
+                return self.enable_session(
+                    session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+                )
             return self.disable_session(session_id, action="keep")
-        return self.enable_session(session_id, mode=clean_mode, ttl_minutes=ttl_minutes)
+        return self.enable_session(
+            session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+        )
 
     # -------------------------------------------------------------------------
     # 9. is_incognito
     # -------------------------------------------------------------------------
 
     def is_incognito(self, session_id: str) -> bool:
-        """Check if a session is currently running under incognito protection."""
+        """Check if a session is protected, including while cleanup is pending."""
         if not session_id:
             return False
         with self._lock:
             leases = self._read_leases()
-            lease = leases.get(session_id)
-            return bool(lease and not lease.get("pending_burn"))
+            return session_id in leases
 
     def get_protected_session_ids(self) -> set[str]:
         """Return all session IDs protected from cross-session search (active or pending burn)."""
@@ -616,6 +698,7 @@ class IncognitoEngine:
 
             return {
                 "active": True,
+                "pending_burn": bool(lease.get("pending_burn")),
                 "session_id": session_id,
                 "mode": lease.get("mode", "standard"),
                 "hidden": True,
@@ -660,13 +743,22 @@ class IncognitoEngine:
             return
         with self._lock:
             leases = self._read_leases()
-            if session_id in leases:
+            lease = leases.get(session_id)
+            if isinstance(lease, dict) and not lease.get("pending_burn") and not _is_ancestor_lease(lease):
                 now = time.time()
                 leases[session_id]["last_activity"] = now
                 ttl = leases[session_id].get("ttl_minutes", 0)
                 if ttl > 0:
                     leases[session_id]["expires_at"] = now + (ttl * 60)
                 self._write_leases(leases)
+
+    def live_head_for(self, session_id: str) -> str | None:
+        """Return the live session that continues a compacted ancestor, if any."""
+        with self._lock:
+            leases = self._read_leases()
+            if not _is_ancestor_lease(leases.get(session_id)):
+                return None
+            return _live_head_for(leases, session_id)
 
     # -------------------------------------------------------------------------
     # 12. propagate_compaction
@@ -676,6 +768,10 @@ class IncognitoEngine:
         """Propagate incognito lease and vault state across session compaction chains."""
         if not old_session_id or not new_session_id:
             return {"ok": False, "error": "both old and new session IDs are required"}
+        if not (_valid_session_id(old_session_id) and _valid_session_id(new_session_id)):
+            return {"ok": False, "error": "Invalid session ID."}
+        if old_session_id == new_session_id:
+            return {"ok": False, "error": "Compaction requires a new session ID."}
 
         with self._lock:
             leases = self._read_leases()
@@ -683,12 +779,24 @@ class IncognitoEngine:
             if not old_lease:
                 return {"ok": True, "propagated": False, "session_id": new_session_id}
 
+            now = time.time()
+            ancestor_lineage = sorted(set(list(old_lease.get("lineage_ids") or []) + [old_session_id]))
+
+            # The new session is the live head: it carries the whole ancestor chain and its own TTL.
             new_lease = dict(old_lease)
+            new_lease.pop("compacted_into", None)
             new_lease["session_id"] = new_session_id
-            existing_lineage = old_lease.get("lineage_ids", [old_session_id])
-            combined_lineage = sorted(list(set(existing_lineage + [old_session_id, new_session_id])))
-            new_lease["lineage_ids"] = combined_lineage
-            old_lease["lineage_ids"] = combined_lineage
+            new_lease["lineage_ids"] = sorted(set(ancestor_lineage + [new_session_id]))
+            new_lease["last_activity"] = now
+            ttl = new_lease.get("ttl_minutes", 0) or 0
+            new_lease["expires_at"] = now + (ttl * 60) if ttl > 0 else None
+
+            # The old session becomes an ancestor. It has no TTL of its own and lists only
+            # its own ancestors, so burning it can never cascade into the live head.
+            old_lease = dict(old_lease)
+            old_lease["compacted_into"] = new_session_id
+            old_lease["expires_at"] = None
+            old_lease["lineage_ids"] = ancestor_lineage
 
             # Clone in-RAM vault
             if old_session_id in self._vaults:
@@ -710,6 +818,8 @@ class IncognitoEngine:
                     try:
                         db.set_session_hidden(new_session_id, True)
                         db.patch_session_model_config(new_session_id, {"incognito": new_lease})
+                        if db.get_session_model_config_value(old_session_id, "incognito") is not None:
+                            db.patch_session_model_config(old_session_id, {"incognito": old_lease})
                     finally:
                         if hasattr(db, "close"):
                             db.close()
@@ -728,29 +838,23 @@ class IncognitoEngine:
     # 13. burn_session
     # -------------------------------------------------------------------------
 
-    def _count_db_rows_for_ids(self, state_db: Path, target_ids: set[str]) -> int:
+    def _count_db_rows_for_ids(self, state_db: Path, target_ids: set[str]) -> int | None:
         """Count remaining rows across sessions and messages tables for target_ids."""
-        if not state_db.is_file() or not target_ids:
+        if not state_db.exists() or not target_ids:
             return 0
-        total = 0
         try:
-            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
             try:
-                cur = conn.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                if cur.fetchone():
-                    for sid in target_ids:
-                        row_s = cur.execute("SELECT count(*) FROM sessions WHERE id = ?", (sid,)).fetchone()
-                        if row_s:
-                            total += int(row_s[0])
-                        row_m = cur.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sid,)).fetchone()
-                        if row_m:
-                            total += int(row_m[0])
+                return sum(
+                    conn.execute(f"SELECT count(*) FROM {table} WHERE {column} = ?", (sid,)).fetchone()[0]
+                    for sid in target_ids
+                    for table, column in (("sessions", "id"), ("messages", "session_id"))
+                )
             finally:
                 conn.close()
-        except Exception:
-            pass
-        return total
+        except sqlite3.Error as exc:
+            logger.debug("Cannot verify incognito database cleanup: %s", exc)
+            return None
 
     def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
         """Retry burning a busy session once its active Gateway turn admission settles."""
@@ -776,202 +880,214 @@ class IncognitoEngine:
         timer.daemon = True
         timer.start()
 
+    def _scrub_burn_files(self, target_ids: set[str]) -> tuple[int, bool]:
+        """Scrub authorized artifacts and report whether any cleanup must be retried."""
+        zero_fill = self.get_settings().get("zero_fill_files", True)
+        files_scrubbed = 0
+        files_pending = False
+
+        def _failed(exc: OSError | RuntimeError) -> None:
+            nonlocal files_pending
+            if not isinstance(exc, FileNotFoundError):
+                files_pending = True
+                logger.debug("Incognito file cleanup deferred: %s", exc)
+
+        def _scrub_file(file_path: Path) -> None:
+            nonlocal files_scrubbed, files_pending
+            try:
+                if file_path.resolve().parts != file_path.parts:
+                    files_pending = True
+                    return
+                info = file_path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    files_pending = True
+                    return
+                if zero_fill and info.st_nlink == 1 and info.st_size > 0:
+                    with file_path.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                file_path.unlink()
+                files_scrubbed += 1
+            except (OSError, RuntimeError) as exc:
+                _failed(exc)
+
+        try:
+            sessions_dir = (self.home_dir / "sessions").resolve()
+            hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
+            for sid in target_ids:
+                for path in _session_files(sessions_dir, sid):
+                    _scrub_file(path)
+                for path in _flat_hook_files(hook_outputs_dir, sid):
+                    _scrub_file(path)
+
+                sid_dir = _hook_session_dir(hook_outputs_dir, sid)
+                if sid_dir is None:
+                    # A missing directory is clean. An unsafe or unreadable entry is not.
+                    try:
+                        (hook_outputs_dir / sid).lstat()
+                    except OSError as exc:
+                        _failed(exc)
+                    else:
+                        files_pending = True
+                    continue
+
+                for directory, _, files in os.walk(sid_dir, topdown=False, onerror=_failed, followlinks=False):
+                    current_dir = Path(directory)
+                    if current_dir.resolve().parts != current_dir.parts:
+                        files_pending = True
+                        continue
+                    for name in files:
+                        _scrub_file(current_dir / name)
+                    try:
+                        current_dir.rmdir()
+                    except OSError as exc:
+                        _failed(exc)
+        except (OSError, RuntimeError) as exc:
+            _failed(exc)
+        return files_scrubbed, files_pending
+
     def burn_session(
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
     ) -> dict[str, Any]:
         """Perform zero-trace scrub of SQLite rows, transcript files, and RAM vault."""
-        if not session_id or not isinstance(session_id, str):
-            raise ValueError("session_id must be a non-empty string")
-        if not _is_valid_session_id(session_id):
-            return {
-                "ok": False,
-                "session_id": session_id,
-                "error": "Invalid session_id format",
-            }
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
 
         with self._lock:
             leases = self._read_leases()
-            raw_lease = leases.get(session_id)
-            has_incognito_lease = isinstance(raw_lease, dict)
-
+            lease = leases.get(session_id, {})
+            authorized_leases: dict[str, dict[str, Any]] = {}
             state_db = self.home_dir / "state.db"
-            has_db_incognito_tag = False
-            db_delete_targets: list[str] = []
-            if SessionDB is not None and state_db.exists():
-                try:
+            db = None
+            try:
+                if SessionDB is not None and state_db.exists():
                     db = SessionDB(db_path=state_db)
-                    try:
-                        if not has_incognito_lease:
-                            if hasattr(db, "get_session_model_config_value"):
-                                has_db_incognito_tag = bool(
-                                    db.get_session_model_config_value(session_id, "incognito")
-                                )
-                            if not has_db_incognito_tag and hasattr(db, "session_ids_with_model_config_key"):
-                                has_db_incognito_tag = session_id in db.session_ids_with_model_config_key(
-                                    "incognito"
-                                )
-                            if not has_db_incognito_tag and hasattr(db, "get_session"):
-                                row = db.get_session(session_id)
-                                if isinstance(row, dict) and row.get("model_config"):
-                                    mc = json.loads(row["model_config"])
-                                    has_db_incognito_tag = isinstance(mc, dict) and bool(mc.get("incognito"))
-                        if (has_incognito_lease or has_db_incognito_tag) and hasattr(
-                            db, "get_session_delete_targets"
-                        ):
-                            targets = db.get_session_delete_targets(session_id)
-                            if targets:
-                                db_delete_targets = [t for t in targets if _is_valid_session_id(t)]
-                    finally:
-                        if hasattr(db, "close"):
-                            db.close()
-                except Exception:
-                    pass
+            except Exception as exc:
+                logger.debug("Cannot open SessionDB for incognito burn: %s", exc)
 
-            if not has_incognito_lease and not has_db_incognito_tag:
-                return {
-                    "ok": False,
-                    "session_id": session_id,
-                    "error": f"Session '{session_id}' is not an incognito session",
+            def _authorized(sid: str) -> bool:
+                if isinstance(leases.get(sid), dict):
+                    authorized_leases[sid] = leases[sid]
+                    return True
+                if db is not None:
+                    try:
+                        marker = db.get_session_model_config_value(sid, "incognito")
+                        if _is_incognito_marker(marker):
+                            authorized_leases[sid] = marker if isinstance(marker, dict) else {}
+                            return True
+                    except Exception as exc:
+                        logger.debug("Cannot check incognito marker for %s: %s", sid, exc)
+                return False
+
+            try:
+                if not _authorized(session_id):
+                    return {"ok": False, "error": "Burn requires an incognito session."}
+
+                def _may_cascade(sid: str) -> bool:
+                    """Cascade only to ancestors; never to a live descendant or another live session."""
+                    member = leases.get(sid)
+                    if not isinstance(member, dict) or member.get("pending_burn"):
+                        return True
+                    if session_id in (member.get("lineage_ids") or []):
+                        return False  # sid continues this session: it is a descendant
+                    return _is_ancestor_lease(member)
+
+                target_ids = {session_id}
+                if isinstance(lease, dict):
+                    target_ids.update(
+                        sid for sid in lease.get("lineage_ids", [])
+                        if _valid_session_id(sid) and _may_cascade(sid) and _authorized(sid)
+                    )
+
+                # Live sessions outside this burn must survive even if Hermes would cascade into them.
+                live_outside = {
+                    sid for sid, other in leases.items()
+                    if sid not in target_ids and isinstance(other, dict) and not other.get("pending_burn")
                 }
 
-            lease = raw_lease if isinstance(raw_lease, dict) else {}
-            target_ids: set[str] = {session_id}
-            for lid in lease.get("lineage_ids", []):
-                if _is_valid_session_id(lid):
-                    target_ids.add(lid)
-            target_ids.update(db_delete_targets)
-
-            rows_before = self._count_db_rows_for_ids(state_db, target_ids)
-
-            # 1. Zero-fill and unlink confined disk files (transcripts and hook outputs)
-            #    before SessionDB.delete_session removes any remaining session files.
-            settings = self.get_settings()
-            zero_fill = settings.get("zero_fill_files", True)
-            files_scrubbed = 0
-
-            sessions_dir = self.home_dir / "sessions"
-            hook_outputs_dir = self.home_dir / "hook_outputs"
-
-            def _scrub_file(file_path: Path) -> None:
-                nonlocal files_scrubbed
-                try:
-                    if file_path.is_file():
-                        if zero_fill:
-                            size = file_path.stat().st_size
-                            if size > 0:
-                                with open(file_path, "r+b") as f:
-                                    f.write(b"\x00" * size)
-                                    f.flush()
-                                    try:
-                                        os.fsync(f.fileno())
-                                    except OSError:
-                                        pass
-                        file_path.unlink(missing_ok=True)
-                        files_scrubbed += 1
-                except Exception as exc:
-                    logger.debug("Failed to scrub file %s: %s", file_path, exc)
-
-            if sessions_dir.is_dir() and not sessions_dir.is_symlink():
-                sessions_root = sessions_dir.resolve()
-                exact_session_names = _session_exact_filenames(target_ids)
-                for p in sessions_dir.iterdir():
-                    if (
-                        not p.is_symlink()
-                        and p.is_file()
-                        and p.name in exact_session_names
-                        and p.resolve().parent == sessions_root
-                    ):
-                        _scrub_file(p)
-
-            if hook_outputs_dir.is_dir() and not hook_outputs_dir.is_symlink():
-                hook_root = hook_outputs_dir.resolve()
-                for sid in target_ids:
-                    if not _is_valid_session_id(sid):
-                        continue
-                    raw_sid_dir = hook_outputs_dir / sid
-                    if raw_sid_dir.is_symlink():
-                        continue
-                    sid_dir = raw_sid_dir.resolve()
-                    if sid_dir.parent != hook_root or sid_dir == hook_root:
-                        continue
-                    if sid_dir.is_dir():
-                        for p in sid_dir.glob("**/*"):
-                            if not p.is_symlink() and p.is_file() and sid_dir in p.resolve().parents:
-                                _scrub_file(p)
+                def _authorized_cascade_target(target: str, owner_sid: str) -> bool:
+                    if _authorized(target):
+                        return True
+                    if db is not None and hasattr(db, "get_session"):
                         try:
-                            for sub in sorted(sid_dir.glob("**/*"), key=lambda x: len(x.parts), reverse=True):
-                                if not sub.is_symlink() and sub.is_dir() and sid_dir in sub.resolve().parents:
-                                    sub.rmdir()
-                            sid_dir.rmdir()
-                        except Exception:
-                            pass
-                exact_hook_names = _hook_exact_filenames(target_ids)
-                for p in hook_outputs_dir.iterdir():
-                    if (
-                        not p.is_symlink()
-                        and p.is_file()
-                        and p.name in exact_hook_names
-                        and p.resolve().parent == hook_root
-                    ):
-                        _scrub_file(p)
+                            row = db.get_session(target)
+                            if (
+                                isinstance(row, dict)
+                                and row.get("source") == "delegate"
+                                and row.get("parent_session_id") in authorized_leases
+                            ):
+                                authorized_leases[target] = dict(authorized_leases.get(owner_sid, {}))
+                                return True
+                        except Exception as exc:
+                            logger.debug("Cannot inspect delegate child %s: %s", target, exc)
+                    return False
 
-            # 2. Delete state.db rows exclusively through SessionDB.delete_session(...)
-            db_deleted = False
-            delete_deferred = False
-            if SessionDB is not None and state_db.exists():
-                try:
-                    db = SessionDB(db_path=state_db)
-                    try:
-                        for sid in list(target_ids):
-                            try:
-                                if db.delete_session(
-                                    sid,
-                                    sessions_dir=sessions_dir,
-                                    include_compression_chain=True,
-                                ):
-                                    db_deleted = True
-                            except Exception as exc:
-                                delete_deferred = True
-                                logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
-                    finally:
-                        if hasattr(db, "close"):
-                            db.close()
-                except Exception as exc:
-                    delete_deferred = True
-                    logger.debug("SessionDB open failed during burn_session: %s", exc)
+                delete_plan: dict[str, list[str]] = {}
+                if db is not None:
+                    for sid in sorted(target_ids):
+                        try:
+                            delete_ids = db.get_session_delete_targets(sid)
+                            if delete_ids and all(
+                                _valid_session_id(target)
+                                and target not in live_outside
+                                and _authorized_cascade_target(target, sid)
+                                for target in delete_ids
+                            ):
+                                delete_plan[sid] = delete_ids
+                                target_ids.update(delete_ids)
+                        except Exception as exc:
+                            logger.debug("Cannot plan SessionDB deletion for %s: %s", sid, exc)
+
+                # Persist recovery before deleting a row that may hold the only incognito marker.
+                lineage = sorted(target_ids)
+                for sid in lineage:
+                    leases[sid] = {
+                        **authorized_leases[sid],
+                        "session_id": sid,
+                        "pending_burn": True,
+                        "expires_at": 0,
+                        "lineage_ids": lineage,
+                    }
+                self._write_leases(leases)
+
+                rows_before = self._count_db_rows_for_ids(state_db, target_ids)
+                db_deleted = False
+                if db is not None:
+                    for sid, delete_ids in delete_plan.items():
+                        try:
+                            # Fence the authorized cascade inside the API's write transaction.
+                            if db.delete_session(
+                                sid, expected_delete_ids=delete_ids, exclude_active_write_guards=True
+                            ):
+                                db_deleted = True
+                        except Exception as exc:
+                            logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
+            finally:
+                if db is not None:
+                    db.close()
 
             rows_after = self._count_db_rows_for_ids(state_db, target_ids)
-            if rows_before > 0 and rows_after == 0 and not delete_deferred:
-                db_deleted = True
-            elif rows_after > 0 or delete_deferred:
-                db_deleted = False
+            db_deleted = rows_after == 0 and (
+                db_deleted or bool(rows_before) or bool(authorized_leases[session_id].get("db_deleted"))
+            )
+            files_scrubbed, files_pending = self._scrub_burn_files(target_ids)
+            pending_burn = rows_after != 0 or files_pending
 
-            # 3. Clear RAM vault
             vault_keys_cleared = 0
-            for sid in target_ids:
-                v = self._vaults.pop(sid, {})
-                self._reverse_vaults.pop(sid, None)
-                self._kind_counters.pop(sid, None)
-                vault_keys_cleared += len(v)
-
-            # 4. Remove active leases, or retain a pending_burn tombstone if Gateway still holds
-            #    an active turn admission lock on the sessions row so sweep/retry finishes it.
-            pending_burn = rows_after > 0 or (delete_deferred and not db_deleted)
             if pending_burn:
-                leases[session_id] = {
-                    **(lease if isinstance(lease, dict) else {}),
-                    "session_id": session_id,
-                    "mode": lease.get("mode", "standard") if isinstance(lease, dict) else "standard",
-                    "pending_burn": True,
-                    "expires_at": 0,
-                    "lineage_ids": sorted(target_ids),
-                }
                 for sid in target_ids:
-                    if sid != session_id:
-                        leases.pop(sid, None)
+                    leases[sid]["db_deleted"] = db_deleted
             else:
                 for sid in target_ids:
                     leases.pop(sid, None)
+                    vault_keys_cleared += len(self._vaults.pop(sid, {}))
+                    self._reverse_vaults.pop(sid, None)
+                    self._kind_counters.pop(sid, None)
             self._write_leases(leases)
 
             if pending_burn and _retry_attempt == 0:
@@ -988,18 +1104,18 @@ class IncognitoEngine:
                 "reason": reason,
                 "db_deleted": db_deleted,
                 "pending_burn": pending_burn,
+                "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
+            audit = self._read_audit()
+            if not pending_burn:
+                audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
+            audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
             if _retry_attempt == 0 or not pending_burn:
-                audit = self._read_audit()
-                if _retry_attempt == 0:
-                    audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
-                audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
-                receipts = audit.setdefault("receipts", [])
-                receipts.append(receipt)
-                self._write_audit(audit)
+                audit.setdefault("receipts", []).append(receipt)
+            self._write_audit(audit)
 
             return {
                 "ok": True,
@@ -1007,6 +1123,7 @@ class IncognitoEngine:
                 "reason": reason,
                 "db_deleted": db_deleted,
                 "pending_burn": pending_burn,
+                "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
@@ -1027,6 +1144,11 @@ class IncognitoEngine:
             for sid, lease in leases.items():
                 if isinstance(lease, dict) and lease.get("pending_burn"):
                     to_burn[sid] = "pending_burn_retry"
+                    continue
+                if _is_ancestor_lease(lease):
+                    # Ancestors burn with their live head, never on their own TTL or owner PID.
+                    if _live_head_for(leases, sid) is None:
+                        to_burn[sid] = "orphaned_ancestor"
                     continue
                 expires_at = lease.get("expires_at")
                 owner_pid = lease.get("owner_pid")
@@ -1072,12 +1194,15 @@ class IncognitoEngine:
 
             swept_receipts = []
             for sid, reason in to_burn.items():
+                if sid in leases and sid not in self._read_leases():
+                    continue  # already burned as an ancestor of an earlier target
                 res = self.burn_session(sid, reason=reason)
-                swept_receipts.append(res)
+                if res.get("ok") and not res.get("pending_burn"):
+                    swept_receipts.append(res)
 
-            if to_burn:
+            if swept_receipts:
                 audit = self._read_audit()
-                audit["orphans_swept"] = audit.get("orphans_swept", 0) + len(to_burn)
+                audit["orphans_swept"] = audit.get("orphans_swept", 0) + len(swept_receipts)
                 self._write_audit(audit)
 
             remaining_leases = {
@@ -1096,74 +1221,24 @@ class IncognitoEngine:
 
     def verify_zero_trace(self, session_id: str) -> dict[str, Any]:
         """Verify zero residual trace across SQLite rows, disk files, and RAM vault."""
-        if not session_id:
-            raise ValueError("session_id must be a non-empty string")
-        if not _is_valid_session_id(session_id):
-            return {
-                "ok": False,
-                "session_id": session_id,
-                "zero_trace": False,
-                "error": "Invalid session_id format",
-            }
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
 
         with self._lock:
-            db_rows_found = 0
-            state_db = self.home_dir / "state.db"
+            db_rows_found = self._count_db_rows_for_ids(self.home_dir / "state.db", {session_id})
 
-            if state_db.is_file():
-                try:
-                    conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
-                    cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                    if cur.fetchone():
-                        cur.execute("SELECT count(*) FROM sessions WHERE id = ?", (session_id,))
-                        row = cur.fetchone()
-                        if row:
-                            db_rows_found += int(row[0])
-                        cur.execute("SELECT count(*) FROM messages WHERE session_id = ?", (session_id,))
-                        row = cur.fetchone()
-                        if row:
-                            db_rows_found += int(row[0])
-                    conn.close()
-                except Exception:
-                    pass
-
-            # Check files using confined paths and exact filename matches
-            single_target = {session_id}
-            session_files_found = 0
             sessions_dir = self.home_dir / "sessions"
-            if sessions_dir.is_dir() and not sessions_dir.is_symlink():
-                sessions_root = sessions_dir.resolve()
-                exact_session_names = _session_exact_filenames(single_target)
-                for p in sessions_dir.iterdir():
-                    if (
-                        not p.is_symlink()
-                        and p.is_file()
-                        and p.name in exact_session_names
-                        and p.resolve().parent == sessions_root
-                    ):
-                        session_files_found += 1
+            session_files_found = sum(
+                path.is_file() or path.is_symlink() for path in _session_files(sessions_dir, session_id)
+            )
 
-            hook_files_found = 0
             hook_outputs_dir = self.home_dir / "hook_outputs"
-            if hook_outputs_dir.is_dir() and not hook_outputs_dir.is_symlink():
-                hook_root = hook_outputs_dir.resolve()
-                raw_sid_dir = hook_outputs_dir / session_id
-                if not raw_sid_dir.is_symlink():
-                    sid_dir = raw_sid_dir.resolve()
-                    if sid_dir.parent == hook_root and sid_dir != hook_root and sid_dir.is_dir():
-                        hook_files_found += sum(
-                            1 for p in sid_dir.glob("**/*") if not p.is_symlink() and sid_dir in p.resolve().parents
-                        )
-                exact_hook_names = _hook_exact_filenames(single_target)
-                for p in hook_outputs_dir.iterdir():
-                    if (
-                        not p.is_symlink()
-                        and p.is_file()
-                        and p.name in exact_hook_names
-                        and p.resolve().parent == hook_root
-                    ):
-                        hook_files_found += 1
+            hook_files_found = sum(1 for _ in _flat_hook_files(hook_outputs_dir, session_id))
+            sid_dir = _hook_session_dir(hook_outputs_dir, session_id)
+            if sid_dir is not None:
+                hook_files_found += sum(1 for _ in sid_dir.glob("**/*"))
+            elif (hook_outputs_dir / session_id).is_symlink():
+                hook_files_found += 1
 
             ram_vault_entries = len(self._vaults.get(session_id, {}))
             leases = self._read_leases()
@@ -1202,8 +1277,14 @@ class IncognitoEngine:
     # 16. status_summary
     # -------------------------------------------------------------------------
 
-    def status_summary(self, session_id: str = "") -> dict[str, Any]:
-        """Aggregate system-wide status, armed state, active sessions, and audit metrics."""
+    def status_summary(self, session_id: str = "", *, include_global: bool = True) -> dict[str, Any]:
+        """Aggregate status, armed state, active sessions, and audit metrics.
+
+        Operator surfaces (CLI, Desktop, RPC, REST) get the full host view. The model-facing
+        tool passes include_global=False and sees only its own session.
+        """
+        if not include_global:
+            return self._session_status(session_id)
         with self._lock:
             current_state = self.get_session_state(session_id) if session_id else None
             armed = self.get_armed_state()
@@ -1248,6 +1329,38 @@ class IncognitoEngine:
                 },
             }
 
+    def _session_status(self, session_id: str) -> dict[str, Any]:
+        """Status for a single session without other sessions or host-wide audit data."""
+        with self._lock:
+            current_state = self.get_session_state(session_id) if _valid_session_id(session_id) else None
+            settings = self.get_settings()
+            is_active = bool(current_state and current_state.get("active"))
+            current_mode = current_state.get("mode", "off") if current_state else "off"
+            current_redact = (
+                current_state.get("redact_pii", False) if current_state
+                else settings.get("redact_outbound_pii", False)
+            )
+            return {
+                "ok": True,
+                "incognito": is_active,
+                "mode": current_mode,
+                "session_state": current_state,
+                "current_session": current_state,
+                "armed": self.get_armed_state(),
+                "metrics": {
+                    "blocked_writes": current_state.get("blocked_writes", 0) if current_state else 0,
+                    "ram_redactions": current_state.get("redactions", 0) if current_state else 0,
+                },
+                "boundaries": {
+                    "memory_blocks": True,
+                    "skill_blocks": True,
+                    "profile_memory_stripped": current_mode == "strict",
+                    "search_blocked": current_mode == "strict",
+                    "outbound_pii_redacted": current_redact,
+                    "zero_fill_on_burn": settings.get("zero_fill_files", True),
+                },
+            }
+
     # -------------------------------------------------------------------------
     # 17. evaluate_tool_guard & scrub_tool_result
     # -------------------------------------------------------------------------
@@ -1275,26 +1388,6 @@ class IncognitoEngine:
                 caller_mode = leases.get(session_id, {}).get("mode", "standard")
 
             for t_name, t_args in calls_to_check:
-                if t_name == "incognito_control":
-                    incog_action = str(t_args.get("action") or "status").strip().lower()
-                    incog_disable = str(
-                        t_args.get("disable_action") or ("keep" if t_args.get("keep", True) else "burn")
-                    ).strip().lower()
-                    if incog_action == "burn" or (
-                        incog_action in ("disable", "off") and incog_disable == "burn"
-                    ):
-                        if not is_caller_incog:
-                            return {
-                                "action": "block",
-                                "message": "Refusing to burn: active session is not in incognito mode.",
-                            }
-                        return {
-                            "action": "approve",
-                            "message": (
-                                f"Confirm permanently burning active incognito session '{session_id}'?"
-                            ),
-                        }
-
                 if t_name == "session_search":
                     target_sid = t_args.get("session_id")
                     if isinstance(target_sid, str) and target_sid in protected_ids:
@@ -1479,8 +1572,10 @@ class IncognitoEngine:
             r"Active Hermes profile:|Conversation started:|#\s+Hermes runtime environment)|\Z)"
         )
         if re.search(r"(?i)(?:MEMORY|USER PROFILE)\s*\([^)]*\)", res):
-            res = single_bar.sub("", res)
-            res = re.sub(r"[═=\-_]{5,}\s*\n?", "", res)
+            marker = "\x00incognito-stripped\x00"
+            res = single_bar.sub(marker, res)
+            # Drop only the closing separator of a removed block, never unrelated rules elsewhere.
+            res = re.sub(re.escape(marker) + r"(?:[ \t]*[═=\-_]{5,}[ \t]*(?:\n|\Z))?", "", res)
 
         # Collapse excess blank lines left behind by removed blocks
         res = re.sub(r"\n{3,}", "\n\n", res)

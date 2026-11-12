@@ -7,7 +7,6 @@ session privacy boundaries and auditing residual forensic traces.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any, Optional
 
 try:
@@ -24,35 +23,17 @@ except (ImportError, ValueError):
     from schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
 
 
-def _resolve_active_sid(kwargs: dict[str, Any]) -> str:
-    """Resolve only the caller's active runtime session ID (never model-supplied args)."""
-    sid = str(
+def _active_sid(kwargs: dict[str, Any]) -> str:
+    return str(
         kwargs.get("session_id")
+        or get_session_env("HERMES_SESSION_ID")
         or kwargs.get("conversation_id")
-        or kwargs.get("task_id")
         or ""
     ).strip()
-    if not sid:
-        try:
-            sid = str(
-                get_session_env("HERMES_SESSION_ID")
-                or get_session_env("HERMES_SESSION_KEY")
-                or ""
-            ).strip()
-        except Exception:
-            sid = ""
-    return sid
-
-
-def _resolve_sid(payload: dict[str, Any], kwargs: dict[str, Any]) -> str:
-    sid = str(payload.get("session_id") or "").strip()
-    if sid:
-        return sid
-    return _resolve_active_sid(kwargs)
 
 
 def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> str:
-    """Inspect or alter incognito privacy states, arming tokens, and manual burns."""
+    """Inspect or change privacy settings for the active session."""
     try:
         payload: dict[str, Any] = {}
         if isinstance(args, dict):
@@ -63,7 +44,7 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
             if k in kwargs and k not in payload:
                 payload[k] = kwargs[k]
 
-        sid = _resolve_active_sid(kwargs)
+        sid = _active_sid(kwargs)
         engine = get_engine()
         action_clean = str(payload.get("action") or "status").strip().lower()
         mode = str(payload.get("mode") or "standard").strip().lower()
@@ -77,9 +58,15 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
         if not disable_action:
             disable_action = "keep" if payload.get("keep", True) else "burn"
 
+        if action_clean in ("burn", "sweep") or (
+            action_clean in ("disable", "off") and disable_action == "burn"
+        ):
+            return json.dumps({"ok": False, "error": "Use /incognito burn or /incognito sweep to delete sessions."})
+
         result: dict[str, Any]
         if action_clean == "status":
-            result = engine.status_summary(session_id=sid)
+            # The model sees only its own session, never other sessions or the host audit.
+            result = engine.status_summary(session_id=sid, include_global=False)
         elif action_clean in ("enable", "on"):
             if not sid:
                 result = engine.arm_next_session(mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii)
@@ -89,9 +76,9 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
                 )
         elif action_clean in ("disable", "off"):
             if not sid or not engine.is_incognito(sid):
-                result = {"ok": False, "error": "Active session is not in incognito mode"}
+                result = {"ok": False, "error": "The active session must be incognito to disable it."}
             else:
-                result = engine.disable_session(session_id=sid, action=disable_action)
+                result = engine.disable_session(session_id=sid)
         elif action_clean == "toggle":
             if not sid:
                 armed = engine.get_armed_state()
@@ -100,19 +87,16 @@ def incognito_control(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> s
                     if armed
                     else engine.arm_next_session(mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii)
                 )
+            elif mode == "off" and not engine.is_incognito(sid):
+                result = {"ok": False, "error": "The active session must be incognito to disable it."}
             else:
-                result = engine.toggle_session(session_id=sid, mode=mode, ttl_minutes=ttl_minutes)
-        elif action_clean == "burn":
-            if not sid or not engine.is_incognito(sid):
-                result = {"ok": False, "error": "Active session is not in incognito mode"}
-            else:
-                result = engine.burn_session(session_id=sid, reason="tool_control_burn")
+                result = engine.toggle_session(
+                    session_id=sid, mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+                )
         elif action_clean == "arm":
             result = engine.arm_next_session(mode=mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii)
         elif action_clean == "disarm":
             result = engine.disarm_next_session()
-        elif action_clean == "sweep":
-            result = engine.sweep_expired()
         elif action_clean == "ttl":
             if not sid:
                 result = {"ok": False, "error": "session_id is required to update TTL"}
@@ -139,7 +123,7 @@ def incognito_verify(args: Optional[dict[str, Any]] = None, **kwargs: Any) -> st
         if "session_id" in kwargs and "session_id" not in payload:
             payload["session_id"] = kwargs["session_id"]
 
-        sid = _resolve_sid(payload, kwargs)
+        sid = str(payload.get("session_id") or _active_sid(kwargs)).strip()
         if not sid:
             return json.dumps({"ok": False, "error": "session_id is required to verify zero trace"})
 

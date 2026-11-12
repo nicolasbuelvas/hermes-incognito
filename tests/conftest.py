@@ -1,19 +1,17 @@
 import json
-import os
 import sys
-import tempfile
 import sqlite3
 import pytest
 from pathlib import Path
 
-# Setup paths
+# Setup paths. The suite never adds a local Hermes install to sys.path: tests must not pick up
+# a real SessionDB, config, or plugin storage from ~/.hermes, so results stay deterministic.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-HERMES_APP_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".hermes"))) / "hermes" / "hermes-agent"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if HERMES_APP_DATA.exists() and str(HERMES_APP_DATA) not in sys.path:
-    sys.path.insert(0, str(HERMES_APP_DATA))
+
+_ENGINE_MODULES = ("engine", "hermes_plugin_incognito_test.engine")
 
 
 class MockSessionDB:
@@ -32,8 +30,10 @@ class MockSessionDB:
                     title TEXT,
                     created_at REAL,
                     updated_at REAL,
-                    metadata TEXT,
-                    model_config TEXT
+                    model_config TEXT,
+                    hidden INTEGER DEFAULT 0,
+                    source TEXT,
+                    parent_session_id TEXT
                 )
             """)
             cursor.execute("""
@@ -47,88 +47,59 @@ class MockSessionDB:
             """)
             conn.commit()
 
-    def create_session(self, session_id: str, source: str = "cli", model: str = "gpt-4", **kwargs) -> None:
-        with sqlite3.connect(str(self.db_path)) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)",
-                (session_id, kwargs.get("title", "")),
-            )
-            conn.commit()
+    def close(self):
+        pass
 
     def get_session(self, session_id: str):
-        with sqlite3.connect(str(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, title, created_at, updated_at, metadata, model_config FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cursor.fetchone()
-            if row:
-                return {
-                    "id": row[0],
-                    "title": row[1],
-                    "created_at": row[2],
-                    "updated_at": row[3],
-                    "metadata": row[4],
-                    "model_config": row[5],
-                }
-            return None
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
 
-    def delete_session(self, session_id: str, sessions_dir=None, include_compression_chain: bool = False, **kwargs):
-        with sqlite3.connect(str(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cur_m = cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            cur_s = cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            conn.commit()
-            return (cur_s.rowcount > 0) or (cur_m.rowcount > 0)
+    def get_session_model_config_value(self, session_id, key):
+        row = self.get_session(session_id) or {}
+        return json.loads(row.get("model_config") or "{}").get(key)
 
-    def set_session_hidden(self, session_id: str, hidden: bool) -> None:
-        pass
+    def session_ids_with_model_config_key(self, key):
+        with sqlite3.connect(self.db_path) as conn:
+            return [
+                sid for sid, config in conn.execute("SELECT id, model_config FROM sessions")
+                if json.loads(config or "{}").get(key) is not None
+            ]
 
-    def patch_session_model_config(self, session_id: str, patch: dict) -> None:
-        if not session_id or not patch:
-            return
-        with sqlite3.connect(str(self.db_path)) as conn:
-            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            if not row:
-                return
-            current = json.loads(row[0]) if row[0] else {}
-            for k, v in patch.items():
-                if v is None:
-                    current.pop(k, None)
-                else:
-                    current[k] = v
-            conn.execute(
-                "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (json.dumps(current) if current else None, session_id),
-            )
-            conn.commit()
+    def set_session_hidden(self, session_id, hidden):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE sessions SET hidden = ? WHERE id = ?", (hidden, session_id))
 
-    def get_session_model_config_value(self, session_id: str, key: str, default=None):
-        sess = self.get_session(session_id) or {}
-        raw = sess.get("model_config")
-        if not raw:
-            return default
-        data = json.loads(raw)
-        return data.get(key, default) if isinstance(data, dict) else default
+    def patch_session_model_config(self, session_id, patch):
+        row = self.get_session(session_id) or {}
+        config = json.loads(row.get("model_config") or "{}")
+        config.update(patch)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (json.dumps(config), session_id))
 
-    def session_ids_with_model_config_key(self, key: str) -> list[str]:
-        out: list[str] = []
-        with sqlite3.connect(str(self.db_path)) as conn:
-            for sid, raw in conn.execute("SELECT id, model_config FROM sessions WHERE model_config IS NOT NULL"):
-                try:
-                    mc = json.loads(raw)
-                    if isinstance(mc, dict) and key in mc and mc[key] is not None:
-                        out.append(sid)
-                except Exception:
-                    pass
-        return out
+    def get_session_delete_targets(self, session_id):
+        if not self.get_session(session_id):
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            delegates = [
+                cid
+                for (cid,) in conn.execute(
+                    "SELECT id FROM sessions WHERE parent_session_id = ? AND source = 'delegate'",
+                    (session_id,),
+                )
+            ]
+        return [session_id, *sorted(delegates)]
 
-    def get_session_delete_targets(self, session_id: str) -> list[str]:
-        return [session_id]
-
-    def close(self) -> None:
-        pass
+    def delete_session(self, session_id, *, expected_delete_ids, exclude_active_write_guards):
+        targets = self.get_session_delete_targets(session_id)
+        assert set(expected_delete_ids) == set(targets)
+        assert exclude_active_write_guards
+        with sqlite3.connect(self.db_path) as conn:
+            for tid in targets:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (tid,))
+            cur = conn.executemany("DELETE FROM sessions WHERE id = ?", [(tid,) for tid in targets])
+            return cur.rowcount > 0
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +110,17 @@ def isolated_hermes_env(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
+    # Even if hermes_state / hermes_cli happen to be importable, use isolated fallbacks.
+    # Tests that need a database opt in with monkeypatch.setattr(engine, "SessionDB", MockSessionDB).
+    import engine as _engine  # noqa: F401  (ensure the top-level module is loaded)
+    for name in _ENGINE_MODULES:
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        monkeypatch.setattr(mod, "SessionDB", None, raising=False)
+        monkeypatch.setattr(mod, "plugin_data_dir", None, raising=False)
+        monkeypatch.setattr(mod, "load_config_readonly", lambda: {}, raising=False)
+
     sessions_dir = tmp_path / "sessions"
     hook_outputs_dir = tmp_path / "hook_outputs"
     plugin_data_dir = tmp_path / "plugin-data" / "incognito"
@@ -147,35 +129,19 @@ def isolated_hermes_env(tmp_path, monkeypatch):
     hook_outputs_dir.mkdir(parents=True, exist_ok=True)
     plugin_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize state.db with real SessionDB schema if available, else MockSessionDB
+    # Initialize a mock state.db in isolated HERMES_HOME
     db_path = tmp_path / "state.db"
-    mock_db = None
-    try:
-        from hermes_state import SessionDB
-        real_db = SessionDB(db_path=db_path)
-        if hasattr(real_db, "close"):
-            real_db.close()
-        mock_db = real_db
-    except Exception:
-        mock_db = MockSessionDB(db_path)
+    mock_db = MockSessionDB(db_path)
 
-    # Reset engine if engine module is importable, and supply MockSessionDB fallback when hermes_state isn't available
+    # Reset engine if engine module is importable
     try:
         import engine
-        if getattr(engine, "SessionDB", None) is None:
-            monkeypatch.setattr(engine, "SessionDB", MockSessionDB)
         if hasattr(engine, "reset_engine"):
             engine.reset_engine()
         elif hasattr(engine, "IncognitoEngine") and hasattr(engine.IncognitoEngine, "reset"):
             engine.IncognitoEngine.reset()
     except ImportError:
         pass
-    pkg_engine = sys.modules.get("hermes_plugin_incognito_test.engine")
-    if pkg_engine is not None:
-        if getattr(pkg_engine, "SessionDB", None) is None:
-            monkeypatch.setattr(pkg_engine, "SessionDB", MockSessionDB)
-        if hasattr(pkg_engine, "reset_engine"):
-            pkg_engine.reset_engine()
 
     yield {
         "home": tmp_path,

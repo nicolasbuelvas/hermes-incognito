@@ -87,7 +87,9 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
 
     if session_id and session_id != "new":
         if hasattr(eng, "toggle_session"):
-            eng.toggle_session(session_id, mode=mode)
+            result = eng.toggle_session(session_id, mode=mode, ttl_minutes=ttl, redact_pii=redact)
+            if not result["ok"]:
+                return result
         elif hasattr(eng, "is_incognito") and hasattr(eng, "disable_session") and hasattr(eng, "enable_session"):
             if eng.is_incognito(session_id):
                 eng.disable_session(session_id, action="keep")
@@ -138,12 +140,10 @@ def burn_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     if not session_id:
         return {"ok": False, "error": "session_id required"}
 
-    receipt = None
-    if hasattr(eng, "burn_session"):
-        receipt = eng.burn_session(session_id, reason="desktop_burn")
-        if isinstance(receipt, dict) and not receipt.get("ok", True):
-            return {"ok": False, "session_id": session_id, "error": receipt.get("error"), "receipt": receipt}
-    return {"ok": True, "session_id": session_id, "receipt": receipt}
+    result = eng.burn_session(session_id, reason="desktop_burn")
+    if not result["ok"]:
+        return result
+    return {"ok": True, "session_id": session_id, "receipt": result}
 
 
 @router.post("/sweep")
@@ -168,7 +168,11 @@ def verify_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     if not session_id:
         return {"ok": False, "error": "session_id required"}
 
-    res = None
-    if hasattr(eng, "verify_zero_trace"):
-        res = eng.verify_zero_trace(session_id)
-    return {"ok": True, "session_id": session_id, "verification": res}
+    if not hasattr(eng, "verify_zero_trace"):
+        return {"ok": False, "error": "verification unavailable", "session_id": session_id}
+    res = eng.verify_zero_trace(session_id)
+    ok = bool(isinstance(res, dict) and res.get("ok"))
+    out: Dict[str, Any] = {"ok": ok, "session_id": session_id, "verification": res}
+    if not ok and isinstance(res, dict) and res.get("error"):
+        out["error"] = res["error"]
+    return out
