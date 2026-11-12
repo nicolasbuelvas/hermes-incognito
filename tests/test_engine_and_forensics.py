@@ -564,3 +564,147 @@ def test_burn_preserves_artifacts_if_recovery_cannot_be_saved(isolated_hermes_en
 
     assert mock_db.get_session(sid) is not None
     assert transcript.read_text() == "synthetic transcript"
+
+
+# --- Ported from upstream main (ebdb0ef) ---
+
+
+def test_burn_session_refuses_non_incognito_and_unsafe_session_ids(isolated_hermes_env, monkeypatch):
+    """
+    burn_session must:
+      1) Refuse any session_id that has neither an incognito lease nor model_config.incognito tag,
+         leaving non-incognito DB rows and transcript files completely untouched.
+      2) Refuse unsafe session_ids containing '/', '\\', '..', or absolute paths.
+      3) Allow burning an orphaned session tagged with model_config.incognito in SessionDB even
+         when leases.json has no entry for it.
+    """
+    # Exercise the SessionDB marker path with the isolated mock (the suite defaults to no SessionDB).
+    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
+    tmp_path = isolated_hermes_env["home"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+    db_path = tmp_path / "state.db"
+
+    # 1. Normal non-incognito session must NOT be burned
+    normal_sid = "sess-normal-untouched"
+    normal_file = isolated_hermes_env["sessions_dir"] / f"{normal_sid}.jsonl"
+    normal_file.write_text('{"role": "user", "content": "important permanent chat"}\n', encoding="utf-8")
+    if engine.SessionDB is not None:
+        real_db = engine.SessionDB(db_path=db_path)
+        try:
+            real_db.create_session(normal_sid, source="cli", model="gpt-4")
+        finally:
+            real_db.close()
+    else:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (normal_sid, "Permanent"))
+            conn.commit()
+
+    refused_normal = eng.burn_session(normal_sid, reason="unauthorized_attempt")
+    assert refused_normal["ok"] is False
+    assert normal_file.exists()
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (normal_sid,)).fetchone()[0] == 1
+
+    # 2. Unsafe path-traversal or absolute session_ids must be refused
+    for bad_id in ("../sessions", "..\\sessions", "foo/bar", "foo\\bar", "a..b", "/abs/path", "C:\\abs\\path"):
+        res_bad = eng.burn_session(bad_id, reason="traversal_attempt")
+        assert res_bad["ok"] is False
+
+    # 3. Session tagged via model_config.incognito in SessionDB (without lease in leases.json) CAN be burned
+    if engine.SessionDB is not None:
+        tagged_sid = "sess-db-tagged-incog"
+        tagged_file = isolated_hermes_env["sessions_dir"] / f"{tagged_sid}.jsonl"
+        tagged_file.write_text('{"role": "user", "content": "orphaned incog"}\n', encoding="utf-8")
+        real_db = engine.SessionDB(db_path=db_path)
+        try:
+            real_db.create_session(tagged_sid, source="cli", model="gpt-4")
+            real_db.patch_session_model_config(tagged_sid, {"incognito": {"mode": "strict"}})
+        finally:
+            real_db.close()
+
+        burned_tagged = eng.burn_session(tagged_sid, reason="orphan_cleanup")
+        assert burned_tagged["ok"] is True
+        assert not tagged_file.exists()
+        with sqlite3.connect(str(db_path)) as conn:
+            assert conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (tagged_sid,)).fetchone()[0] == 0
+
+
+def test_burn_and_verify_confine_hook_outputs_and_use_exact_filenames(isolated_hermes_env):
+    """
+    burn_session and verify_zero_trace must:
+      1) Use exact filename matches in sessions/ and hook_outputs/ so prefix/substring neighbors
+         (e.g. 'sessions.json', 'sess-10.jsonl', 'sess-10.txt') are NEVER touched or flagged.
+      2) Confine sid_dir deletion so resolved sid_dir must be a direct child of hook_outputs_dir.resolve()
+         (refusing symlink escapes outside hook_outputs_dir).
+    """
+    tmp_path = isolated_hermes_env["home"]
+    sessions_dir = isolated_hermes_env["sessions_dir"]
+    hook_outputs_dir = isolated_hermes_env["hook_outputs_dir"]
+    eng = IncognitoEngine(home_dir=tmp_path)
+
+    # Session ID 'sess-1' is a prefix substring of 'sess-10' and 'session' is a substring of 'sessions.json'
+    target_sid = "session"
+    neighbor_sid = "session-keep"
+
+    gateway_index = sessions_dir / "sessions.json"
+    gateway_index.write_text('{"telegram:123": "session-keep"}', encoding="utf-8")
+    neighbor_transcript = sessions_dir / f"{neighbor_sid}.jsonl"
+    neighbor_transcript.write_text('{"role": "user", "content": "neighbor"}\n', encoding="utf-8")
+    neighbor_hook_file = hook_outputs_dir / f"{neighbor_sid}.txt"
+    neighbor_hook_file.write_text("neighbor hook output", encoding="utf-8")
+
+    own_transcript = sessions_dir / f"{target_sid}.jsonl"
+    own_transcript.write_text('{"role": "user", "content": "secret"}\n', encoding="utf-8")
+    own_hook_dir = hook_outputs_dir / target_sid
+    own_hook_dir.mkdir(parents=True, exist_ok=True)
+    own_spill = own_hook_dir / "spill1.txt"
+    own_spill.write_text("secret spill", encoding="utf-8")
+    own_hook_flat = hook_outputs_dir / f"{target_sid}.txt"
+    own_hook_flat.write_text("flat spill", encoding="utf-8")
+
+    eng.enable_session(target_sid, mode="strict")
+    res = eng.burn_session(target_sid, reason="burn")
+    assert res["ok"] is True
+
+    # Own files deleted
+    assert not own_transcript.exists()
+    assert not own_spill.exists()
+    assert not own_hook_dir.exists()
+    assert not own_hook_flat.exists()
+
+    # Substring neighbor files and sessions.json MUST survive untouched
+    assert gateway_index.exists()
+    assert neighbor_transcript.exists()
+    assert neighbor_hook_file.exists()
+
+    # verify_zero_trace on target_sid must report zero_trace=True despite substring neighbors existing
+    verified = eng.verify_zero_trace(target_sid)
+    assert verified["zero_trace"] is True
+    assert verified["session_files_found"] == 0
+    assert verified["hook_files_found"] == 0
+
+    # If a symlink or junctions in hook_outputs/<sid> resolves outside hook_outputs_dir, do not delete outside target
+    outside_dir = tmp_path / "outside_protected_dir"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "must_survive.txt"
+    outside_file.write_text("critical host data", encoding="utf-8")
+
+    symlink_sid = "sess-symlink-escape"
+    link_path = hook_outputs_dir / symlink_sid
+    symlink_created = False
+    try:
+        link_path.symlink_to(outside_dir, target_is_directory=True)
+        symlink_created = True
+    except OSError:
+        pass
+
+    if symlink_created:
+        eng.enable_session(symlink_sid, mode="standard")
+        eng.burn_session(symlink_sid, reason="burn")
+        assert outside_file.exists()
+
+
+def test_engine_never_issues_raw_sql_deletes():
+    """Ported from upstream: state.db rows are deleted only through SessionDB.delete_session()."""
+    engine_source = (PROJECT_ROOT / "engine.py").read_text(encoding="utf-8")
+    assert "DELETE FROM" not in engine_source
