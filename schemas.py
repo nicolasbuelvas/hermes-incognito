@@ -66,9 +66,8 @@ class AuditData(TypedDict, total=False):
 INCOGNITO_CONTROL_SCHEMA: dict[str, Any] = {
     "name": "incognito_control",
     "description": (
-        "Control ephemeral and incognito session privacy: view status, enable standard or strict "
-        "clean-room mode, arm the next session, update inactivity TTL, sweep expired orphans, "
-        "or immediately burn and scrub session records."
+        "Manage privacy for the active session: view status, enable standard or strict "
+        "clean-room mode, arm the next session, or update inactivity TTL."
     ),
     "parameters": {
         "type": "object",
@@ -80,16 +79,14 @@ INCOGNITO_CONTROL_SCHEMA: dict[str, Any] = {
                     "enable",
                     "disable",
                     "toggle",
-                    "burn",
                     "arm",
                     "disarm",
-                    "sweep",
                     "ttl",
                 ],
                 "description": (
                     "Action to execute: 'status' to view state, 'enable' to enter incognito, "
-                    "'disable' to leave incognito, 'toggle' to switch, 'burn' to purge immediately, "
-                    "'arm' to prepare next session, 'disarm' to cancel armed token, 'sweep' to clean expired, "
+                    "'disable' to leave incognito and retain history, 'toggle' to switch, "
+                    "'arm' to prepare the next session, 'disarm' to cancel the armed token, "
                     "or 'ttl' to update inactivity timeout."
                 ),
                 "default": "status",
@@ -103,11 +100,6 @@ INCOGNITO_CONTROL_SCHEMA: dict[str, Any] = {
                 ),
                 "default": "standard",
             },
-            "session_id": {
-                "type": "string",
-                "description": "Target session ID. Defaults to the active session.",
-                "default": "",
-            },
             "ttl_minutes": {
                 "type": "integer",
                 "description": "Idle inactivity timeout in minutes before orphan sweeps purge the session (0 disables).",
@@ -116,12 +108,6 @@ INCOGNITO_CONTROL_SCHEMA: dict[str, Any] = {
             "redact_pii": {
                 "type": "boolean",
                 "description": "Whether to mask outbound emails, phone numbers, cards, and tokens in RAM.",
-            },
-            "disable_action": {
-                "type": "string",
-                "enum": ["keep", "burn"],
-                "description": "When disabling incognito: 'keep' unhides into history, 'burn' purges traces immediately.",
-                "default": "keep",
             },
         },
         "required": [],

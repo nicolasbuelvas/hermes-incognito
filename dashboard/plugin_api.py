@@ -138,10 +138,10 @@ def burn_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     if not session_id:
         return {"ok": False, "error": "session_id required"}
 
-    receipt = None
-    if hasattr(eng, "burn_session"):
-        receipt = eng.burn_session(session_id, reason="desktop_burn")
-    return {"ok": True, "session_id": session_id, "receipt": receipt}
+    result = eng.burn_session(session_id, reason="desktop_burn")
+    if not result["ok"]:
+        return result
+    return {"ok": True, "session_id": session_id, "receipt": result}
 
 
 @router.post("/sweep")

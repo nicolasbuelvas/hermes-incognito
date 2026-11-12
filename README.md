@@ -114,7 +114,7 @@ Within any active Hermes conversation:
 
 The plugin registers two tools for autonomous or user-guided privacy operations:
 
-- **`incognito_control`**: Enables, arms, toggles, disables, or burns sessions.
+- **`incognito_control`**: Manages privacy for the active session and arms the next session. Use `/incognito burn`, the CLI, or the Desktop burn control to delete a session.
   ```json
   {
     "action": "enable",
@@ -144,10 +144,10 @@ When used with Hermes Desktop, Incognito provides native integration:
 
 ## Forensic Zero-Trace Verification Walkthrough
 
-When an incognito session is burned or expires via idle TTL, the scrubbing engine guarantees complete elimination of local residue:
+A manual burn or idle TTL cleanup clears local artifacts associated with the incognito session:
 
-1. **Database Scrubbing:** Executes `DELETE FROM sessions WHERE id = ?` and `DELETE FROM messages WHERE session_id = ?` against local `state.db`.
-2. **File Overwrite & Unlink:** Locates JSONL transcripts in `$HERMES_HOME/sessions/` and temporary artifacts in `$HERMES_HOME/hook_outputs/`. Overwrites every byte with zero blocks before calling file unlink.
+1. **Database Scrubbing:** Uses Hermes `SessionDB.delete_session()` for authorized incognito rows. If Hermes defers deletion during an active write, the lease stays pending and cleanup retries.
+2. **File Overwrite & Unlink:** Locates JSONL transcripts in `$HERMES_HOME/sessions/` and temporary artifacts in `$HERMES_HOME/hook_outputs/`. Overwrites regular, unshared files with zeros before unlinking when zero fill is enabled. Skips symlinks.
 3. **Vault Depletion:** Discards in-memory encryption keys and reversible PII mapping tables.
 4. **Audit Receipt:** Emits a content-free cryptographic receipt containing timestamp, verification checksum, and counts of cleared artifacts.
 

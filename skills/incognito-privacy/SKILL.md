@@ -33,10 +33,8 @@ Control ephemeral state on the current or target session.
   `incognito_control(action="arm", mode="strict", ttl_minutes=45)`
 - Disarm pending session:
   `incognito_control(action="disarm")`
-- Purge and burn immediately:
-  `incognito_control(action="burn")`
 - Disable incognito while retaining chat transcript:
-  `incognito_control(action="disable", keep=true)`
+  `incognito_control(action="disable")`
 
 ### Tool: `incognito_verify`
 Run forensic verification on a session ID to confirm zero lingering trace on disk and in memory:

@@ -84,14 +84,29 @@ def test_tools_dispatch_with_dict_args_and_kwargs(isolated_hermes_env):
     assert status["incognito"] is True
     assert status["mode"] == "strict"
 
-    burned = json.loads(incognito_control({"action": "burn"}, conversation_id="sess-tool-1"))
-    assert burned["ok"] is True
-    assert burned["receipt_id"]
-
     verified = json.loads(incognito_verify({"session_id": "sess-tool-1"}))
     assert verified["ok"] is True
-    assert verified["zero_trace"] is True
-    assert verified["receipt_id"] == burned["receipt_id"]
+    assert verified["zero_trace"] is False
+
+
+def test_model_tool_cannot_burn_sweep_or_target_other_sessions():
+    for sid in ("active", "other"):
+        assert json.loads(incognito_control({"action": "enable"}, conversation_id=sid))["ok"]
+
+    for payload in (
+        {"action": "burn"}, {"action": "sweep"}, {"action": "off", "keep": False},
+        {"action": "disable", "disable_action": "burn"},
+    ):
+        payload["session_id"] = "other"
+        assert not json.loads(incognito_control(payload, conversation_id="active"))["ok"]
+
+    disabled = json.loads(incognito_control(
+        {"action": "disable", "session_id": "other"}, conversation_id="active"
+    ))
+    assert disabled["ok"]
+    assert disabled["session_id"] == "active"
+    assert not json.loads(incognito_control({"action": "disable"}, conversation_id="active"))["ok"]
+    assert json.loads(incognito_control({"action": "status"}, conversation_id="other"))["incognito"]
 
 
 def test_slash_cli_rpc_and_rest_api_end_to_end(isolated_hermes_env, capsys):

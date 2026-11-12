@@ -13,10 +13,11 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 # Allowed Hermes public API imports with fallbacks for standalone/pytest environments
 try:
@@ -107,6 +108,47 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 VALID_MODES: tuple[str, ...] = ("off", "standard", "strict")
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_REQUEST_DUMP = re.compile(r"request_dump_(.+)_[0-9]{8}_[0-9]{6}_[0-9]{6}\.json")
+
+
+def _valid_session_id(session_id: str) -> bool:
+    return isinstance(session_id, str) and _SESSION_ID.fullmatch(session_id) is not None
+
+
+def _is_incognito_marker(marker: Any) -> bool:
+    return isinstance(marker, dict) or marker is True
+
+
+def _session_files(directory: Path, session_id: str) -> Iterator[Path]:
+    names = {f"{session_id}.json", f"{session_id}.jsonl", f"session_{session_id}.json"}
+    if directory.is_dir():
+        for path in directory.iterdir():
+            dump = _REQUEST_DUMP.fullmatch(path.name)
+            if path.name in names or (dump and dump[1] == session_id):
+                yield path
+
+
+def _hook_session_dir(directory: Path, session_id: str) -> Path | None:
+    root = directory.resolve()
+    child = root / session_id
+    # Reject aliases even when they point to a different child of the same root.
+    try:
+        if not child.is_symlink() and child.is_dir() and child.resolve().parts == child.parts:
+            return child
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
+def _flat_hook_files(directory: Path, session_id: str) -> Iterator[Path]:
+    names = {f"{session_id}.txt", f"{session_id}.json", f"{session_id}.jsonl"}
+    if directory.is_dir():
+        for path in directory.iterdir():
+            if path.name in names and (path.is_file() or path.is_symlink()):
+                yield path
+
 
 # Common PII and credential patterns for in-RAM reversible vault
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -695,29 +737,23 @@ class IncognitoEngine:
     # 13. burn_session
     # -------------------------------------------------------------------------
 
-    def _count_db_rows_for_ids(self, state_db: Path, target_ids: set[str]) -> int:
+    def _count_db_rows_for_ids(self, state_db: Path, target_ids: set[str]) -> int | None:
         """Count remaining rows across sessions and messages tables for target_ids."""
-        if not state_db.is_file() or not target_ids:
+        if not state_db.exists() or not target_ids:
             return 0
-        total = 0
         try:
-            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
             try:
-                cur = conn.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                if cur.fetchone():
-                    for sid in target_ids:
-                        row_s = cur.execute("SELECT count(*) FROM sessions WHERE id = ?", (sid,)).fetchone()
-                        if row_s:
-                            total += int(row_s[0])
-                        row_m = cur.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sid,)).fetchone()
-                        if row_m:
-                            total += int(row_m[0])
+                return sum(
+                    conn.execute(f"SELECT count(*) FROM {table} WHERE {column} = ?", (sid,)).fetchone()[0]
+                    for sid in target_ids
+                    for table, column in (("sessions", "id"), ("messages", "session_id"))
+                )
             finally:
                 conn.close()
-        except Exception:
-            pass
-        return total
+        except sqlite3.Error as exc:
+            logger.debug("Cannot verify incognito database cleanup: %s", exc)
+            return None
 
     def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
         """Retry burning a busy session once its active Gateway turn admission settles."""
@@ -747,138 +783,117 @@ class IncognitoEngine:
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
     ) -> dict[str, Any]:
         """Perform zero-trace scrub of SQLite rows, transcript files, and RAM vault."""
-        if not session_id:
-            raise ValueError("session_id must be a non-empty string")
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
 
         with self._lock:
-            target_ids: set[str] = {session_id}
             leases = self._read_leases()
-            lease = leases.get(session_id, {})
-            for lid in lease.get("lineage_ids", []):
-                target_ids.add(lid)
-
+            lease = leases.get(session_id)
             state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
-                try:
+            db = None
+            try:
+                if SessionDB is not None and state_db.exists():
                     db = SessionDB(db_path=state_db)
-                    try:
-                        targets = db.get_session_delete_targets(session_id)
-                        if targets:
-                            target_ids.update(targets)
-                    finally:
-                        if hasattr(db, "close"):
-                            db.close()
-                except Exception:
-                    pass
+            except Exception as exc:
+                logger.debug("Cannot open SessionDB for incognito burn: %s", exc)
 
-            rows_before = self._count_db_rows_for_ids(state_db, target_ids)
-
-            # 1. Delete via SessionDB (retires admissions/workers and removes FTS + session rows)
-            db_deleted = False
-            if SessionDB is not None and state_db.exists():
-                for sid in list(target_ids):
+            def _authorized(sid: str) -> bool:
+                if isinstance(leases.get(sid), dict):
+                    return True
+                if db is not None:
                     try:
-                        db = SessionDB(db_path=state_db)
-                        try:
-                            if db.delete_session(
-                                sid,
-                                sessions_dir=self.home_dir / "sessions",
-                                include_compression_chain=True,
-                            ):
-                                db_deleted = True
-                        finally:
-                            if hasattr(db, "close"):
-                                db.close()
+                        return _is_incognito_marker(db.get_session_model_config_value(sid, "incognito"))
                     except Exception as exc:
-                        logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
+                        logger.debug("Cannot check incognito marker for %s: %s", sid, exc)
+                return False
 
-            # Direct SQLite scrub: commit message deletion independently first so FTS5 and
-            # message content are purged immediately even if sessions_runtime_ledger_delete_guard
-            # defers deleting the sessions row until the turn admission reaches 'terminal'.
-            if state_db.is_file():
-                try:
-                    conn = sqlite3.connect(str(state_db), timeout=5.0)
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
-                        if cur.fetchone():
-                            for sid in target_ids:
-                                cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                            conn.commit()
-                    except Exception:
-                        pass
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                        if cur.fetchone():
-                            for sid in target_ids:
-                                cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                            conn.commit()
-                            if rows_before > 0:
+            try:
+                if not _authorized(session_id):
+                    return {"ok": False, "error": "Burn requires an incognito session."}
+
+                target_ids = {session_id}
+                if isinstance(lease, dict):
+                    target_ids.update(
+                        sid for sid in lease.get("lineage_ids", [])
+                        if _valid_session_id(sid) and _authorized(sid)
+                    )
+
+                rows_before = self._count_db_rows_for_ids(state_db, target_ids)
+                db_deleted = False
+                if db is not None:
+                    for sid in sorted(target_ids):
+                        try:
+                            # Hermes can cascade to delegates or other rows in a local conversation.
+                            # Fence that cascade inside the API's write transaction.
+                            delete_ids = db.get_session_delete_targets(sid)
+                            if not delete_ids or not all(
+                                _valid_session_id(target) and _authorized(target) for target in delete_ids
+                            ):
+                                continue
+                            if db.delete_session(
+                                sid, expected_delete_ids=delete_ids, exclude_active_write_guards=True
+                            ):
+                                target_ids.update(delete_ids)
                                 db_deleted = True
-                    except Exception:
-                        pass
-                    finally:
-                        conn.close()
-                except Exception:
-                    pass
+                        except Exception as exc:
+                            logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
+            finally:
+                if db is not None:
+                    db.close()
 
             rows_after = self._count_db_rows_for_ids(state_db, target_ids)
-            if rows_before > 0 and rows_after == 0:
-                db_deleted = True
-            elif rows_after > 0:
-                db_deleted = False
+            pending_burn = rows_after != 0
+            db_deleted = not pending_burn and (db_deleted or bool(rows_before))
 
             # 2. Scrub disk files (transcripts and hook outputs)
             settings = self.get_settings()
             zero_fill = settings.get("zero_fill_files", True)
             files_scrubbed = 0
 
-            sessions_dir = self.home_dir / "sessions"
-            hook_outputs_dir = self.home_dir / "hook_outputs"
+            sessions_dir = (self.home_dir / "sessions").resolve()
+            hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
 
             def _scrub_file(file_path: Path) -> None:
                 nonlocal files_scrubbed
                 try:
-                    if file_path.is_file():
-                        if zero_fill:
-                            size = file_path.stat().st_size
-                            if size > 0:
-                                with open(file_path, "r+b") as f:
-                                    f.write(b"\x00" * size)
-                                    f.flush()
-                                    try:
-                                        os.fsync(f.fileno())
-                                    except OSError:
-                                        pass
-                        file_path.unlink(missing_ok=True)
-                        files_scrubbed += 1
-                except Exception as exc:
+                    if file_path.resolve().parts != file_path.parts:
+                        return
+                    info = file_path.lstat()
+                    if not stat.S_ISREG(info.st_mode):
+                        return
+                    if zero_fill and info.st_nlink == 1 and info.st_size > 0:
+                        with file_path.open("r+b") as handle:
+                            opened = os.fstat(handle.fileno())
+                            if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                                return
+                            handle.write(b"\x00" * opened.st_size)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    file_path.unlink()
+                    files_scrubbed += 1
+                except FileNotFoundError:
+                    pass
+                except (OSError, RuntimeError) as exc:
                     logger.debug("Failed to scrub file %s: %s", file_path, exc)
 
-            if sessions_dir.is_dir():
-                for p in sessions_dir.iterdir():
-                    if p.is_file() and any(sid in p.name for sid in target_ids):
-                        _scrub_file(p)
+            for sid in target_ids:
+                for path in _session_files(sessions_dir, sid):
+                    _scrub_file(path)
+                for path in _flat_hook_files(hook_outputs_dir, sid):
+                    _scrub_file(path)
 
-            if hook_outputs_dir.is_dir():
-                for sid in target_ids:
-                    sid_dir = hook_outputs_dir / sid
-                    if sid_dir.is_dir():
-                        for p in sid_dir.glob("**/*"):
-                            if p.is_file():
-                                _scrub_file(p)
+                sid_dir = _hook_session_dir(hook_outputs_dir, sid)
+                if sid_dir is not None:
+                    for directory, _, files in os.walk(sid_dir, topdown=False, followlinks=False):
+                        current_dir = Path(directory)
+                        if current_dir.resolve().parts != current_dir.parts:
+                            continue
+                        for name in files:
+                            _scrub_file(current_dir / name)
                         try:
-                            # Remove directories from inside out
-                            for sub in sorted(sid_dir.glob("**/*"), key=lambda x: len(x.parts), reverse=True):
-                                if sub.is_dir():
-                                    sub.rmdir()
-                            sid_dir.rmdir()
-                        except Exception:
+                            current_dir.rmdir()
+                        except OSError:
                             pass
-                for p in hook_outputs_dir.iterdir():
-                    if p.is_file() and any(sid in p.name for sid in target_ids):
-                        _scrub_file(p)
 
             # 3. Clear RAM vault
             vault_keys_cleared = 0
@@ -890,7 +905,6 @@ class IncognitoEngine:
 
             # 4. Remove active leases, or retain a pending_burn tombstone if Gateway still holds
             #    an active turn admission lock on the sessions row so sweep/retry finishes it.
-            pending_burn = rows_after > 0
             if pending_burn:
                 leases[session_id] = {
                     **(lease if isinstance(lease, dict) else {}),
@@ -900,9 +914,6 @@ class IncognitoEngine:
                     "expires_at": 0,
                     "lineage_ids": sorted(target_ids),
                 }
-                for sid in target_ids:
-                    if sid != session_id:
-                        leases.pop(sid, None)
             else:
                 for sid in target_ids:
                     leases.pop(sid, None)
@@ -1007,11 +1018,12 @@ class IncognitoEngine:
             swept_receipts = []
             for sid, reason in to_burn.items():
                 res = self.burn_session(sid, reason=reason)
-                swept_receipts.append(res)
+                if res.get("ok"):
+                    swept_receipts.append(res)
 
-            if to_burn:
+            if swept_receipts:
                 audit = self._read_audit()
-                audit["orphans_swept"] = audit.get("orphans_swept", 0) + len(to_burn)
+                audit["orphans_swept"] = audit.get("orphans_swept", 0) + len(swept_receipts)
                 self._write_audit(audit)
 
             remaining_leases = {
@@ -1030,48 +1042,24 @@ class IncognitoEngine:
 
     def verify_zero_trace(self, session_id: str) -> dict[str, Any]:
         """Verify zero residual trace across SQLite rows, disk files, and RAM vault."""
-        if not session_id:
-            raise ValueError("session_id must be a non-empty string")
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
 
         with self._lock:
-            db_rows_found = 0
-            state_db = self.home_dir / "state.db"
+            db_rows_found = self._count_db_rows_for_ids(self.home_dir / "state.db", {session_id})
 
-            if state_db.is_file():
-                try:
-                    conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
-                    cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                    if cur.fetchone():
-                        cur.execute("SELECT count(*) FROM sessions WHERE id = ?", (session_id,))
-                        row = cur.fetchone()
-                        if row:
-                            db_rows_found += int(row[0])
-                        cur.execute("SELECT count(*) FROM messages WHERE session_id = ?", (session_id,))
-                        row = cur.fetchone()
-                        if row:
-                            db_rows_found += int(row[0])
-                    conn.close()
-                except Exception:
-                    pass
-
-            # Check files
-            session_files_found = 0
             sessions_dir = self.home_dir / "sessions"
-            if sessions_dir.is_dir():
-                for p in sessions_dir.iterdir():
-                    if p.is_file() and session_id in p.name:
-                        session_files_found += 1
+            session_files_found = sum(
+                path.is_file() or path.is_symlink() for path in _session_files(sessions_dir, session_id)
+            )
 
-            hook_files_found = 0
             hook_outputs_dir = self.home_dir / "hook_outputs"
-            if hook_outputs_dir.is_dir():
-                sid_dir = hook_outputs_dir / session_id
-                if sid_dir.is_dir():
-                    hook_files_found += len(list(sid_dir.glob("**/*")))
-                for p in hook_outputs_dir.iterdir():
-                    if p.is_file() and session_id in p.name:
-                        hook_files_found += 1
+            hook_files_found = sum(1 for _ in _flat_hook_files(hook_outputs_dir, session_id))
+            sid_dir = _hook_session_dir(hook_outputs_dir, session_id)
+            if sid_dir is not None:
+                hook_files_found += sum(1 for _ in sid_dir.glob("**/*"))
+            elif (hook_outputs_dir / session_id).is_symlink():
+                hook_files_found += 1
 
             ram_vault_entries = len(self._vaults.get(session_id, {}))
             leases = self._read_leases()

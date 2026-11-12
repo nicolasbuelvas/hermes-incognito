@@ -152,7 +152,7 @@ def test_engine_propagate_compaction(isolated_hermes_env):
         assert eng.get_vault_entry(new_sess, "[REDACTED_EMAIL_1]") == "alice.smith@example.org"
 
 
-def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env):
+def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env, monkeypatch):
     """
     Test burn_session deletes session rows, zero-fills files before unlink,
     clears RAM vault, and records content-free receipt.
@@ -162,6 +162,7 @@ def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env):
 
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
+    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
     if hasattr(eng, "config"):
         eng.config["zero_fill_files"] = True
 
@@ -202,7 +203,7 @@ def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env):
         cursor = conn.cursor()
         cursor.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,))
         assert cursor.fetchone()[0] == 0
-        cursor.execute("SELECT count(*) FROM messages WHERE id = ?", (sess_id,))
+        cursor.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,))
         assert cursor.fetchone()[0] == 0
 
 
@@ -298,21 +299,13 @@ def test_engine_concurrency(isolated_hermes_env):
     assert not errors, f"Concurrency errors occurred: {errors}"
 
 
-def test_engine_burn_busy_session_purges_messages_and_defers_session_row(isolated_hermes_env, monkeypatch):
-    """
-    Regression test for Gateway runtime race: when SQLite's sessions_runtime_ledger_delete_guard
-    blocks DELETE FROM sessions while a turn admission is still settling, burn_session must:
-      1) Immediately purge all rows from messages (wiping FTS/content right away).
-      2) Retain a pending_burn tombstone in leases (keeping get_protected_session_ids() active).
-      3) Complete full zero-trace deletion on the next sweep_expired() once the guard clears.
-    """
-    if IncognitoEngine is None:
-        pytest.skip("IncognitoEngine not yet importable")
-
-    monkeypatch.setattr(engine, "SessionDB", None)
+def test_engine_burn_busy_session_defers_until_sessiondb_can_delete(isolated_hermes_env, monkeypatch):
+    """A busy admission keeps the session and its messages until SessionDB can delete both."""
+    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
-    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
+    retries = []
+    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda sid, attempt: retries.append((sid, attempt)))
 
     sess_id = "local-busy-admission-chat"
     db_path = tmp_path / "state.db"
@@ -339,12 +332,13 @@ def test_engine_burn_busy_session_purges_messages_and_defers_session_row(isolate
     eng.enable_session(sess_id, mode="strict")
     burn_res = eng.burn_session(sess_id, reason="session_finalize")
 
-    # Messages MUST be wiped immediately even though sessions row is temporarily guarded
+    # The failed SessionDB transaction leaves both rows intact.
     with sqlite3.connect(str(db_path)) as conn:
         msg_count = conn.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,)).fetchone()[0]
         sess_count = conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,)).fetchone()[0]
-    assert msg_count == 0
+    assert msg_count == 1
     assert sess_count == 1
+    assert retries == [(sess_id, 1)]
     assert burn_res["db_deleted"] is False
     assert burn_res["pending_burn"] is True
     assert eng.is_incognito(sess_id) is False
@@ -359,3 +353,87 @@ def test_engine_burn_busy_session_purges_messages_and_defers_session_row(isolate
     verify = eng.verify_zero_trace(sess_id)
     assert verify["zero_trace"] is True
     assert sess_id not in eng.get_protected_session_ids()
+
+
+def test_burn_requires_lease_or_database_marker(isolated_hermes_env, monkeypatch):
+    mock_db = isolated_hermes_env["mock_db"]
+    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    eng = IncognitoEngine()
+    sid, public_sid = "private", "public"
+    public_file = eng.home_dir / "sessions" / f"{public_sid}.jsonl"
+    public_file.write_text("keep")
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.execute("INSERT INTO sessions (id) VALUES (?)", (public_sid,))
+        conn.execute("INSERT INTO sessions (id, model_config) VALUES (?, ?)", (sid, '{"incognito": {}}'))
+
+    assert not eng.burn_session(public_sid)["ok"]
+    assert not eng.burn_session("../public")["ok"]
+    assert not eng.burn_session(r"bad\public")["ok"]
+    assert not eng.burn_session(str(public_file))["ok"]
+    assert eng.burn_session(sid)["db_deleted"]
+    assert public_file.read_text() == "keep"
+    assert mock_db.get_session(public_sid)
+
+
+def test_burn_refuses_unmarked_cascade(isolated_hermes_env, monkeypatch):
+    mock_db = isolated_hermes_env["mock_db"]
+    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(type(mock_db), "get_session_delete_targets", lambda db, sid: [sid, "public"])
+    eng = IncognitoEngine()
+    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.executemany("INSERT INTO sessions (id) VALUES (?)", [("private",), ("public",)])
+    eng.enable_session("private")
+    leases = eng._read_leases()
+    leases["private"]["lineage_ids"] += ["public", "../public"]
+    eng._write_leases(leases)
+
+    result = eng.burn_session("private")
+    assert result["pending_burn"]
+    assert mock_db.get_session("private")
+    assert mock_db.get_session("public")
+
+
+def test_burn_uses_exact_file_ownership_and_rejects_symlinks(isolated_hermes_env):
+    eng = IncognitoEngine()
+    eng.enable_session("private")
+    sessions = isolated_hermes_env["sessions_dir"]
+    hooks = isolated_hermes_env["hook_outputs_dir"]
+    outside = isolated_hermes_env["home"] / "outside"
+    outside.mkdir()
+    keep = outside / "keep.txt"
+    keep.write_text("outside")
+    (hooks / "private").symlink_to(outside, target_is_directory=True)
+    (sessions / "private.jsonl").symlink_to(keep)
+    owned_files = [
+        sessions / "session_private.json",
+        sessions / "request_dump_private_20261112_123456_123456.json",
+        hooks / "private.txt",
+    ]
+    public_files = [
+        sessions / "private-other.jsonl",
+        sessions / "request_dump_private_other_20261112_123456_123456.json",
+        hooks / "private-other.txt",
+    ]
+    for path in owned_files + public_files:
+        path.write_text("content")
+
+    result = eng.burn_session("private")
+    assert result["files_scrubbed"] == len(owned_files)
+    assert all(not path.exists() for path in owned_files)
+    assert all(path.read_text() == "content" for path in public_files)
+    assert keep.read_text() == "outside"
+
+
+def test_burn_leaves_rows_pending_when_sessiondb_is_unavailable(isolated_hermes_env, monkeypatch):
+    eng = IncognitoEngine()
+    monkeypatch.setattr(engine, "SessionDB", None)
+    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
+    eng.enable_session("private")
+    mock_db = isolated_hermes_env["mock_db"]
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.execute("INSERT INTO sessions (id) VALUES ('private')")
+
+    assert eng.burn_session("private")["pending_burn"]
+    assert mock_db.get_session("private")
+    assert not eng.verify_zero_trace("private")["zero_trace"]

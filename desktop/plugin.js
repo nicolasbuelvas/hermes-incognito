@@ -55,6 +55,20 @@ async function callBackend(ctx, action, payload = {}) {
   return null
 }
 
+async function burnFromDesktop(ctx, sessionId) {
+  const response = await callBackend(ctx, 'burn', { session_id: sessionId })
+  const result = response?.receipt || response
+  if (!result?.ok) {
+    host.notify({ kind: 'warning', message: result?.error || 'Unable to burn this session' })
+    return
+  }
+  notifyStateListeners()
+  host.notify({
+    kind: 'warning',
+    message: result.pending_burn ? 'Burn pending. Hermes will retry database cleanup.' : 'Session burned'
+  })
+}
+
 function NoticeBanner() {
   return jsx('div', {
     style: {
@@ -189,9 +203,7 @@ function ComposerPrivacyBanner({ ctx }) {
                 size: 'sm',
                 variant: 'destructive',
                 onClick: async () => {
-                  await callBackend(ctx, 'burn', { session_id: focusedSessionId })
-                  notifyStateListeners()
-                  host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+                  await burnFromDesktop(ctx, focusedSessionId)
                 },
                 children: 'Burn Now'
               })
@@ -439,9 +451,7 @@ function PrivacyControlCenter({ ctx }) {
                     disabled: !focusedSessionId,
                     onClick: async () => {
                       if (!focusedSessionId) return
-                      await callBackend(ctx, 'burn', { session_id: focusedSessionId })
-                      notifyStateListeners()
-                      host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+                      await burnFromDesktop(ctx, focusedSessionId)
                     },
                     children: 'Burn Session'
                   })
@@ -843,9 +853,7 @@ export default {
               host.notify({ kind: 'warning', message: 'No active session to burn' })
               return
             }
-            await callBackend(ctx, 'burn', { session_id: sid })
-            notifyStateListeners()
-            host.notify({ kind: 'warning', message: 'Session burned: zero trace remains' })
+            await burnFromDesktop(ctx, sid)
           }
         }
       },

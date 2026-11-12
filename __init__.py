@@ -57,7 +57,7 @@ def register(ctx: Any) -> None:
         toolset="incognito",
         schema=INCOGNITO_CONTROL_SCHEMA,
         handler=incognito_control,
-        description="Manage incognito session status, mode, arming, TTL, and manual burns",
+        description="Manage active incognito session status, mode, arming, and TTL",
     )
     ctx.register_tool(
         name="incognito_verify",
@@ -129,10 +129,12 @@ def register(ctx: Any) -> None:
             return
         if engine.is_incognito(sid) and engine.get_settings().get("auto_purge_on_exit", True):
             reason = str(kwargs.get("hook_name") or "session_finalize")
-            engine.burn_session(sid, reason=reason)
-            if hasattr(ctx, "emit_to_session"):
+            result = engine.burn_session(sid, reason=reason)
+            if result.get("ok") and hasattr(ctx, "emit_to_session"):
                 try:
-                    ctx.emit_to_session(sid, "state.changed", {"active": False, "burned": True})
+                    ctx.emit_to_session(sid, "state.changed", {
+                        "active": False, "burned": not result["pending_burn"]
+                    })
                 except Exception:
                     pass
 
@@ -238,23 +240,26 @@ def register(ctx: Any) -> None:
             engine.arm_next_session(mode="strict", ttl_minutes=ttl)
             return "Next session armed for strict incognito mode."
 
+        if subcmd == "burn" or (
+            subcmd in ("off", "disable") and len(parts) > 1 and parts[1].lower() == "burn"
+        ):
+            if not sid:
+                return "No active session ID to burn."
+            res = engine.burn_session(sid, reason="slash_burn")
+            if not res["ok"]:
+                return f"Burn refused: {res['error']}"
+            _emit_state()
+            if res["pending_burn"]:
+                return f"Burn pending for session {sid}. Hermes will retry database cleanup."
+            return f"Incognito session {sid} burned. Files scrubbed: {res['files_scrubbed']}. (Receipt: {res['receipt_id']})"
+
         if subcmd in ("off", "disable"):
-            action = "burn" if len(parts) > 1 and parts[1].lower() == "burn" else "keep"
             if sid:
-                engine.disable_session(sid, action=action)
+                engine.disable_session(sid)
                 _emit_state()
-                if action == "burn":
-                    return f"Session {sid} burned: SQLite rows purged, transcript files scrubbed, RAM cleared."
                 return f"Incognito mode disabled for session {sid}. History retained."
             engine.disarm_next_session()
             return "Disarmed pending next-session token."
-
-        if subcmd == "burn":
-            if sid:
-                res = engine.burn_session(sid, reason="slash_burn")
-                _emit_state()
-                return f"Incognito session {sid} burned. Files scrubbed: {res.get('files_scrubbed', 0)}. (Receipt: {res.get('receipt_id')})"
-            return "No active session ID to burn."
 
         if subcmd == "arm":
             mode = "strict" if len(parts) > 1 and parts[1].lower() == "strict" else "standard"
@@ -447,13 +452,17 @@ def register(ctx: Any) -> None:
             res = engine.burn_session(target_sid, reason="cli_burn")
             if as_json:
                 print(json.dumps(res, indent=2))
+            elif not res["ok"]:
+                print(f"Burn refused: {res['error']}")
+            elif res["pending_burn"]:
+                print(f"Burn pending for session {target_sid}. Hermes will retry database cleanup.")
             else:
                 print(
                     f"✓ Burned session {target_sid}: DB deleted={res.get('db_deleted')}, "
                     f"Files scrubbed={res.get('files_scrubbed')}, "
                     f"Vault cleared={res.get('vault_keys_cleared')} (Receipt: {res.get('receipt_id')})"
                 )
-            return 0
+            return 0 if res["ok"] else 1
 
         elif cmd == "verify":
             target_sid = getattr(args, "session_id", "")

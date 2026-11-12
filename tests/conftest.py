@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -31,7 +32,8 @@ class MockSessionDB:
                     title TEXT,
                     created_at REAL,
                     updated_at REAL,
-                    metadata TEXT
+                    model_config TEXT,
+                    hidden INTEGER DEFAULT 0
                 )
             """)
             cursor.execute("""
@@ -45,21 +47,46 @@ class MockSessionDB:
             """)
             conn.commit()
 
-    def get_session(self, session_id: str):
-        with sqlite3.connect(str(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, title, created_at, updated_at, metadata FROM sessions WHERE id = ?", (session_id,))
-            row = cursor.fetchone()
-            if row:
-                return {"id": row[0], "title": row[1], "created_at": row[2], "updated_at": row[3], "metadata": row[4]}
-            return None
+    def close(self):
+        pass
 
-    def delete_session(self, session_id: str):
-        with sqlite3.connect(str(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            cursor.execute("DELETE FROM messages WHERE id = ?", (session_id,))
-            conn.commit()
+    def get_session(self, session_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_session_model_config_value(self, session_id, key):
+        row = self.get_session(session_id) or {}
+        return json.loads(row.get("model_config") or "{}").get(key)
+
+    def session_ids_with_model_config_key(self, key):
+        with sqlite3.connect(self.db_path) as conn:
+            return [
+                sid for sid, config in conn.execute("SELECT id, model_config FROM sessions")
+                if json.loads(config or "{}").get(key) is not None
+            ]
+
+    def set_session_hidden(self, session_id, hidden):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE sessions SET hidden = ? WHERE id = ?", (hidden, session_id))
+
+    def patch_session_model_config(self, session_id, patch):
+        row = self.get_session(session_id) or {}
+        config = json.loads(row.get("model_config") or "{}")
+        config.update(patch)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (json.dumps(config), session_id))
+
+    def get_session_delete_targets(self, session_id):
+        return [session_id] if self.get_session(session_id) else []
+
+    def delete_session(self, session_id, *, expected_delete_ids, exclude_active_write_guards):
+        assert expected_delete_ids == [session_id]
+        assert exclude_active_write_guards
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            return conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,)).rowcount > 0
 
 
 @pytest.fixture(autouse=True)
