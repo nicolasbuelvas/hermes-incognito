@@ -150,19 +150,17 @@ def test_transform_llm_request_strict_memory_stripping(isolated_hermes_env):
     assert "Follow rules strictly." in trans_system_content
 
 
-def test_transform_pii_redaction_and_restoration(isolated_hermes_env):
+def test_transform_pii_masks_and_never_restores(isolated_hermes_env):
     """
-    redact_pii=True replaces synthetic emails and phone numbers with [REDACTED_EMAIL_1] / [REDACTED_PHONE_1],
-    and transform_llm_response restores the exact original values in assistant text.
-    After burn_session, the RAM vault is emptied.
+    redact_pii=True replaces synthetic emails and phone numbers with stable [EMAIL_1] / [PHONE_1]
+    placeholders. Replies are left as the model wrote them: originals are never put back into
+    anything Hermes stores. After burn_session, the RAM vault is emptied.
     """
     if IncognitoEngine is None:
         pytest.skip("IncognitoEngine not yet importable")
 
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
-    if hasattr(eng, "config"):
-        eng.config["redact_outbound_pii"] = True
 
     sess_id = "sess-transform-pii"
     eng.enable_session(sess_id, mode="standard", redact_pii=True)
@@ -181,20 +179,15 @@ def test_transform_pii_redaction_and_restoration(isolated_hermes_env):
 
     assert original_email not in trans_content
     assert original_phone not in trans_content
-    assert "[REDACTED_EMAIL_" in trans_content or "[REDACTED_" in trans_content
+    assert trans_content == "Contact me at [EMAIL_1] or [PHONE_1] for verification."
 
-    # Simulate assistant response repeating back the token
-    assistant_text = f"Received notification for token in: {trans_content}"
-    resp = {"choices": [{"message": {"role": "assistant", "content": assistant_text}}]}
+    # The same value gets the same placeholder on the next request.
+    again = eng.transform_llm_request(sess_id, {"messages": [{"role": "user", "content": original_email}]})
+    assert again["request"]["messages"][0]["content"] == "[EMAIL_1]"
 
-    restored_resp = eng.transform_llm_response(sess_id, resp)
-    assert restored_resp is not None
-    restored_content = restored_resp["choices"][0]["message"]["content"]
+    resp = {"choices": [{"message": {"role": "assistant", "content": f"Noted: {trans_content}"}}]}
+    assert eng.transform_llm_response(sess_id, resp) is None
 
-    assert original_email in restored_content
-    assert original_phone in restored_content
-
-    # Burn session and verify RAM vault is empty
     eng.burn_session(sess_id, reason="test_cleanup")
     zero_trace = eng.verify_zero_trace(sess_id)
     assert zero_trace.get("ram_vault_entries") == 0

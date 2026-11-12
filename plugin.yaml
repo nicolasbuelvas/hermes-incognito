@@ -57,8 +57,8 @@ config_schema:
   redact_outbound_pii:
     type: bool
     default: false
-    label: Redact outbound PII in RAM
-    description: Mask emails, phone numbers, payment cards, and secrets with reversible RAM-only placeholders before provider requests.
+    label: Mask personal details
+    description: Replace emails, phones, cards, IBANs, IDs (cédula/NIT/SSN), IPs, passwords, API keys, and street addresses with placeholders like [EMAIL_1] before anything is sent to a model. Sends that can't be checked are blocked.
   provider_zdr_hints:
     type: bool
     default: true
@@ -69,3 +69,8 @@ config_schema:
     default: true
     label: Zero-fill files before deletion
     description: Overwrite transcript JSONL and hook spill files with zero bytes prior to unlinking.
+  save_undo_minutes:
+    type: int
+    default: 10
+    label: Undo window after saving (minutes)
+    description: How long a chat saved from Incognito can still be returned to Incognito. Closing the chat ends it sooner.

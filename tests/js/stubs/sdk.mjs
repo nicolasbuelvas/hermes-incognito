@@ -5,13 +5,15 @@ let focused = ''
 export function setFocused(sid) {
   focused = sid
 }
+export const drafts = {}
 export const host = {
   state: { focusedSessionId: { get: () => focused } },
   notify: t => toasts.push(t),
-  navigate: () => {}
+  navigate: () => {},
+  composer: { getDraft: sid => drafts[sid ?? ''] ?? null }
 }
 export const Button = props => ({ type: 'Button', props })
-export const COMPOSER_AREAS = { top: 'composer.top' }
+export const COMPOSER_AREAS = { top: 'composer.top', underside: 'composer.underside', middleware: 'composer.middleware' }
 export const KEYBINDS_AREA = 'keybinds'
 export const PALETTE_AREA = 'palette'
 export const ROUTES_AREA = 'routes'
