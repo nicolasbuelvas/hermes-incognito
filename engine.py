@@ -900,22 +900,40 @@ class IncognitoEngine:
                         if _valid_session_id(sid) and _authorized(sid)
                     )
 
-                rows_before = self._count_db_rows_for_ids(state_db, target_ids)
-                db_deleted = False
+                delete_plan: dict[str, list[str]] = {}
                 if db is not None:
                     for sid in sorted(target_ids):
                         try:
-                            # Hermes can cascade to delegates or other rows in a local conversation.
-                            # Fence that cascade inside the API's write transaction.
                             delete_ids = db.get_session_delete_targets(sid)
-                            if not delete_ids or not all(
+                            if delete_ids and all(
                                 _valid_session_id(target) and _authorized(target) for target in delete_ids
                             ):
-                                continue
+                                delete_plan[sid] = delete_ids
+                                target_ids.update(delete_ids)
+                        except Exception as exc:
+                            logger.debug("Cannot plan SessionDB deletion for %s: %s", sid, exc)
+
+                # Persist recovery before deleting a row that may hold the only incognito marker.
+                lineage = sorted(target_ids)
+                for sid in lineage:
+                    leases[sid] = {
+                        **authorized_leases[sid],
+                        "session_id": sid,
+                        "pending_burn": True,
+                        "expires_at": 0,
+                        "lineage_ids": lineage,
+                    }
+                self._write_leases(leases)
+
+                rows_before = self._count_db_rows_for_ids(state_db, target_ids)
+                db_deleted = False
+                if db is not None:
+                    for sid, delete_ids in delete_plan.items():
+                        try:
+                            # Fence the authorized cascade inside the API's write transaction.
                             if db.delete_session(
                                 sid, expected_delete_ids=delete_ids, exclude_active_write_guards=True
                             ):
-                                target_ids.update(delete_ids)
                                 db_deleted = True
                         except Exception as exc:
                             logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
@@ -932,18 +950,8 @@ class IncognitoEngine:
 
             vault_keys_cleared = 0
             if pending_burn:
-                # A deleted DB row may have been the only marker for a lineage member.
-                # Retain a lease for every authorized target so all can finish cleanup.
-                lineage = sorted(target_ids)
                 for sid in target_ids:
-                    leases[sid] = {
-                        **authorized_leases[sid],
-                        "session_id": sid,
-                        "pending_burn": True,
-                        "expires_at": 0,
-                        "lineage_ids": lineage,
-                        "db_deleted": db_deleted,
-                    }
+                    leases[sid]["db_deleted"] = db_deleted
             else:
                 for sid in target_ids:
                     leases.pop(sid, None)

@@ -489,3 +489,53 @@ def test_file_cleanup_failure_keeps_burn_pending_across_restart(isolated_hermes_
     assert result["db_deleted"]
     assert not path.exists()
     assert restarted.verify_zero_trace(sid)["zero_trace"]
+
+
+def test_burn_recovers_after_interruption_with_database_only_marker(isolated_hermes_env, monkeypatch):
+    mock_db = isolated_hermes_env["mock_db"]
+    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    eng = IncognitoEngine()
+    sid = "interrupted-cleanup"
+    transcript = isolated_hermes_env["sessions_dir"] / f"{sid}.jsonl"
+    transcript.write_text("synthetic transcript")
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.execute("INSERT INTO sessions (id, model_config) VALUES (?, ?)", (sid, '{"incognito": {"mode": "strict"}}'))
+        conn.execute("INSERT INTO sessions (id) VALUES (?)", ("public",))
+
+    def interrupt_before_file_cleanup(_target_ids):
+        raise SystemExit
+
+    assert not eng.is_incognito(sid)
+    monkeypatch.setattr(eng, "_scrub_burn_files", interrupt_before_file_cleanup)
+    with pytest.raises(SystemExit):
+        eng.burn_session(sid)
+
+    assert mock_db.get_session(sid) is None
+    assert transcript.exists()
+    restarted = IncognitoEngine()
+    assert restarted.get_session_state(sid)["pending_burn"]
+    assert restarted.evaluate_tool_guard(sid, "cronjob_manage")["action"] == "block"
+    assert restarted.sweep_expired()["swept_count"] == 1
+    assert restarted.verify_zero_trace(sid)["zero_trace"]
+    assert mock_db.get_session("public") is not None
+
+
+def test_burn_preserves_artifacts_if_recovery_cannot_be_saved(isolated_hermes_env, monkeypatch):
+    mock_db = isolated_hermes_env["mock_db"]
+    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    eng = IncognitoEngine()
+    sid = "recovery-write-error"
+    transcript = isolated_hermes_env["sessions_dir"] / f"{sid}.jsonl"
+    transcript.write_text("synthetic transcript")
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.execute("INSERT INTO sessions (id, model_config) VALUES (?, ?)", (sid, '{"incognito": true}'))
+
+    def fail_recovery_write(_leases):
+        raise PermissionError("cannot write recovery metadata")
+
+    monkeypatch.setattr(eng, "_write_leases", fail_recovery_write)
+    with pytest.raises(PermissionError):
+        eng.burn_session(sid)
+
+    assert mock_db.get_session(sid) is not None
+    assert transcript.read_text() == "synthetic transcript"
