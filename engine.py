@@ -1371,6 +1371,24 @@ class IncognitoEngine:
                 caller_mode = leases.get(session_id, {}).get("mode", "standard")
 
             for t_name, t_args in calls_to_check:
+                if t_name == "incognito_control":
+                    # Deletion is reserved for user-facing controls. Refuse model-started burns and
+                    # sweeps before the tool runs, including when wrapped in a deferred tool_call.
+                    incog_action = str(t_args.get("action") or "status").strip().lower()
+                    incog_disable = str(
+                        t_args.get("disable_action") or ("keep" if t_args.get("keep", True) else "burn")
+                    ).strip().lower()
+                    if incog_action in ("burn", "sweep") or (
+                        incog_action in ("disable", "off") and incog_disable == "burn"
+                    ):
+                        return {
+                            "action": "block",
+                            "message": (
+                                "The model cannot delete sessions. Ask the user to run /incognito burn "
+                                "or use the Desktop Burn control."
+                            ),
+                        }
+
                 if t_name == "session_search":
                     target_sid = t_args.get("session_id")
                     if isinstance(target_sid, str) and target_sid in protected_ids:

@@ -48,6 +48,12 @@ class MockSessionDB:
     def close(self):
         pass
 
+    def create_session(self, session_id: str, source: str = "cli", model: str = "", **kwargs):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions (id, title) VALUES (?, ?)", (session_id, kwargs.get("title", ""))
+            )
+
     def get_session(self, session_id: str):
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row

@@ -109,6 +109,71 @@ def test_model_tool_cannot_burn_sweep_or_target_other_sessions():
     assert json.loads(incognito_control({"action": "status"}, conversation_id="other"))["incognito"]
 
 
+def test_incognito_control_burn_and_disable_only_target_active_incognito_and_block_model_burns(isolated_hermes_env):
+    """
+    Model-facing incognito_control must:
+      1) Omit session_id from INCOGNITO_CONTROL_SCHEMA and ignore payload['session_id'] on burn/disable.
+      2) Refuse burn and disable unless engine.is_incognito(active_sid) is True.
+      3) Block model-started burns (action='burn' or disable with burn) in pre_tool_call.
+         Ported from upstream main, where these were routed to 'approve'. This PR reserves
+         deletion for user-facing controls, so the guard blocks them instead.
+    """
+    assert "session_id" not in INCOGNITO_CONTROL_SCHEMA["parameters"]["properties"]
+
+    ctx = _RecordingCtx()
+    plugin_init.register(ctx)
+    pre_tool = ctx.hooks["pre_tool_call"]
+
+    # Victim incognito session exists on host, while caller is a different non-incognito session
+    incognito_control({"action": "enable", "mode": "strict"}, conversation_id="sess-victim-incog")
+
+    # Attempt cross-session burn via payload['session_id'] from non-incognito caller -> refused & victim intact
+    cross_burn = json.loads(
+        incognito_control(
+            {"action": "burn", "session_id": "sess-victim-incog"},
+            conversation_id="sess-normal-caller",
+        )
+    )
+    assert cross_burn["ok"] is False
+    cross_disable = json.loads(
+        incognito_control(
+            {"action": "disable", "disable_action": "burn", "session_id": "sess-victim-incog"},
+            conversation_id="sess-normal-caller",
+        )
+    )
+    assert cross_disable["ok"] is False
+
+    victim_status = json.loads(incognito_control({"action": "status"}, conversation_id="sess-victim-incog"))
+    assert victim_status["incognito"] is True
+
+    # pre_tool_call blocks model-started burn from non-incognito session
+    guard_non_incog = pre_tool("incognito_control", {"action": "burn"}, session_id="sess-normal-caller")
+    assert guard_non_incog is not None
+    assert guard_non_incog["action"] == "block"
+
+    # pre_tool_call blocks model-started burns even on the active incognito session
+    guard_incog_burn = pre_tool("incognito_control", {"action": "burn"}, session_id="sess-victim-incog")
+    assert guard_incog_burn is not None
+    assert guard_incog_burn["action"] == "block"
+
+    guard_incog_disable_burn = pre_tool(
+        "incognito_control",
+        {"action": "disable", "keep": False},
+        session_id="sess-victim-incog",
+    )
+    assert guard_incog_disable_burn is not None
+    assert guard_incog_disable_burn["action"] == "block"
+
+    guard_wrapped_burn = pre_tool(
+        "tool_call",
+        {"calls": [{"name": "incognito_control", "arguments": {"action": "burn"}}]},
+        session_id="sess-victim-incog",
+    )
+    assert guard_wrapped_burn is not None
+    assert guard_wrapped_burn["action"] == "block"
+
+
+
 def test_slash_cli_rpc_and_rest_api_end_to_end(isolated_hermes_env, capsys):
     ctx = _RecordingCtx()
     plugin_init.register(ctx)
