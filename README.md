@@ -146,7 +146,7 @@ When used with Hermes Desktop, Incognito provides native integration:
 
 A manual burn or idle TTL cleanup clears local artifacts associated with the incognito session:
 
-1. **Database Scrubbing:** Uses Hermes `SessionDB.delete_session()` for authorized incognito rows. If Hermes defers deletion during an active write, the lease stays pending and cleanup retries.
+1. **Database Scrubbing:** Uses Hermes `SessionDB.delete_session()` for authorized incognito rows. If Hermes defers deletion during an active write or an artifact cannot be removed, the lease and privacy protections remain active while cleanup retries.
 2. **File Overwrite & Unlink:** Locates JSONL transcripts in `$HERMES_HOME/sessions/` and temporary artifacts in `$HERMES_HOME/hook_outputs/`. Overwrites regular, unshared files with zeros before unlinking when zero fill is enabled. Skips symlinks.
 3. **Vault Depletion:** Discards in-memory encryption keys and reversible PII mapping tables.
 4. **Audit Receipt:** Emits a content-free cryptographic receipt containing timestamp, verification checksum, and counts of cleared artifacts.

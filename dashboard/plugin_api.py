@@ -87,7 +87,9 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
 
     if session_id and session_id != "new":
         if hasattr(eng, "toggle_session"):
-            eng.toggle_session(session_id, mode=mode)
+            result = eng.toggle_session(session_id, mode=mode)
+            if not result["ok"]:
+                return result
         elif hasattr(eng, "is_incognito") and hasattr(eng, "disable_session") and hasattr(eng, "enable_session"):
             if eng.is_incognito(session_id):
                 eng.disable_session(session_id, action="keep")

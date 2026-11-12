@@ -341,7 +341,15 @@ def test_engine_burn_busy_session_defers_until_sessiondb_can_delete(isolated_her
     assert retries == [(sess_id, 1)]
     assert burn_res["db_deleted"] is False
     assert burn_res["pending_burn"] is True
-    assert eng.is_incognito(sess_id) is False
+    assert eng.is_incognito(sess_id)
+    assert eng.get_session_state(sess_id)["pending_burn"]
+    assert eng.evaluate_tool_guard(sess_id, "memory")["action"] == "block"
+    assert eng.evaluate_tool_guard(sess_id, "skill_manage")["action"] == "block"
+    assert eng.evaluate_tool_guard(sess_id, "cronjob_manage")["action"] == "block"
+    assert not eng.enable_session(sess_id)["ok"]
+    assert not eng.disable_session(sess_id)["ok"]
+    assert not eng.toggle_session(sess_id)["ok"]
+    assert not eng.set_session_ttl(sess_id, 0)["ok"]
     assert sess_id in eng.get_protected_session_ids()
 
     # Once Gateway marks admission terminal (guard cleared), sweep_expired completes zero-trace
@@ -437,3 +445,47 @@ def test_burn_leaves_rows_pending_when_sessiondb_is_unavailable(isolated_hermes_
     assert eng.burn_session("private")["pending_burn"]
     assert mock_db.get_session("private")
     assert not eng.verify_zero_trace("private")["zero_trace"]
+
+
+def test_file_cleanup_failure_keeps_burn_pending_across_restart(isolated_hermes_env, monkeypatch):
+    mock_db = isolated_hermes_env["mock_db"]
+    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    eng = IncognitoEngine()
+    retries = []
+    monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda sid, attempt: retries.append((sid, attempt)))
+    sid = "file-cleanup-retry"
+    path = isolated_hermes_env["sessions_dir"] / f"{sid}.jsonl"
+    path.write_text("synthetic transcript")
+    with sqlite3.connect(mock_db.db_path) as conn:
+        conn.execute("INSERT INTO sessions (id) VALUES (?)", (sid,))
+    eng.enable_session(sid, mode="strict", redact_pii=True)
+    request = {"messages": [{"role": "user", "content": "example@example.org"}]}
+    eng.transform_llm_request(sid, request)
+
+    unlink = Path.unlink
+
+    def fail_transcript_unlink(file_path, *args, **kwargs):
+        if file_path == path:
+            raise PermissionError("temporary file cleanup error")
+        return unlink(file_path, *args, **kwargs)
+
+    with monkeypatch.context() as fail:
+        fail.setattr(Path, "unlink", fail_transcript_unlink)
+        result = eng.burn_session(sid)
+        assert result["ok"] and result["pending_burn"] and result["files_pending"]
+        assert result["db_deleted"] and mock_db.get_session(sid) is None
+        assert eng.sweep_expired()["swept_count"] == 0
+
+    assert path.exists()
+    assert retries[0] == (sid, 1)
+    assert eng.is_incognito(sid)
+    verification = eng.verify_zero_trace(sid)
+    assert verification["ram_vault_entries"] == 1
+    assert not verification["zero_trace"]
+
+    restarted = IncognitoEngine()
+    result = restarted.burn_session(sid)
+    assert result["ok"] and not result["pending_burn"] and not result["files_pending"]
+    assert result["db_deleted"]
+    assert not path.exists()
+    assert restarted.verify_zero_trace(sid)["zero_trace"]

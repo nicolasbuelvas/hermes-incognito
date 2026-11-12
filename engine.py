@@ -448,6 +448,9 @@ class IncognitoEngine:
             raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
 
         with self._lock:
+            leases = self._read_leases()
+            if leases.get(session_id, {}).get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
             settings = self.get_settings()
             ttl = ttl_minutes if ttl_minutes is not None else settings.get("default_ttl_minutes", 60)
             redact = redact_pii if redact_pii is not None else settings.get("redact_outbound_pii", False)
@@ -482,7 +485,6 @@ class IncognitoEngine:
                 except Exception:
                     pass
 
-            leases = self._read_leases()
             leases[session_id] = lease
             self._write_leases(leases)
 
@@ -505,6 +507,9 @@ class IncognitoEngine:
             return self.burn_session(session_id, reason="disable_burn")
 
         with self._lock:
+            leases = self._read_leases()
+            if leases.get(session_id, {}).get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
@@ -518,7 +523,6 @@ class IncognitoEngine:
                 except Exception:
                     pass
 
-            leases = self._read_leases()
             leases.pop(session_id, None)
             self._write_leases(leases)
 
@@ -537,6 +541,8 @@ class IncognitoEngine:
             leases = self._read_leases()
             if session_id not in leases:
                 return {"ok": False, "error": f"Session '{session_id}' is not currently incognito"}
+            if leases[session_id].get("pending_burn"):
+                return {"ok": False, "error": "Session burn is pending."}
             leases[session_id]["ttl_minutes"] = int(ttl_minutes)
             now = time.time()
             leases[session_id]["expires_at"] = now + (int(ttl_minutes) * 60) if int(ttl_minutes) > 0 else None
@@ -571,13 +577,12 @@ class IncognitoEngine:
     # -------------------------------------------------------------------------
 
     def is_incognito(self, session_id: str) -> bool:
-        """Check if a session is currently running under incognito protection."""
+        """Check if a session is protected, including while cleanup is pending."""
         if not session_id:
             return False
         with self._lock:
             leases = self._read_leases()
-            lease = leases.get(session_id)
-            return bool(lease and not lease.get("pending_burn"))
+            return session_id in leases
 
     def get_protected_session_ids(self) -> set[str]:
         """Return all session IDs protected from cross-session search (active or pending burn)."""
@@ -625,6 +630,7 @@ class IncognitoEngine:
 
             return {
                 "active": True,
+                "pending_burn": bool(lease.get("pending_burn")),
                 "session_id": session_id,
                 "mode": lease.get("mode", "standard"),
                 "hidden": True,
@@ -669,7 +675,7 @@ class IncognitoEngine:
             return
         with self._lock:
             leases = self._read_leases()
-            if session_id in leases:
+            if session_id in leases and not leases[session_id].get("pending_burn"):
                 now = time.time()
                 leases[session_id]["last_activity"] = now
                 ttl = leases[session_id].get("ttl_minutes", 0)
@@ -779,6 +785,77 @@ class IncognitoEngine:
         timer.daemon = True
         timer.start()
 
+    def _scrub_burn_files(self, target_ids: set[str]) -> tuple[int, bool]:
+        """Scrub authorized artifacts and report whether any cleanup must be retried."""
+        zero_fill = self.get_settings().get("zero_fill_files", True)
+        files_scrubbed = 0
+        files_pending = False
+
+        def _failed(exc: OSError | RuntimeError) -> None:
+            nonlocal files_pending
+            if not isinstance(exc, FileNotFoundError):
+                files_pending = True
+                logger.debug("Incognito file cleanup deferred: %s", exc)
+
+        def _scrub_file(file_path: Path) -> None:
+            nonlocal files_scrubbed, files_pending
+            try:
+                if file_path.resolve().parts != file_path.parts:
+                    files_pending = True
+                    return
+                info = file_path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    files_pending = True
+                    return
+                if zero_fill and info.st_nlink == 1 and info.st_size > 0:
+                    with file_path.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                file_path.unlink()
+                files_scrubbed += 1
+            except (OSError, RuntimeError) as exc:
+                _failed(exc)
+
+        try:
+            sessions_dir = (self.home_dir / "sessions").resolve()
+            hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
+            for sid in target_ids:
+                for path in _session_files(sessions_dir, sid):
+                    _scrub_file(path)
+                for path in _flat_hook_files(hook_outputs_dir, sid):
+                    _scrub_file(path)
+
+                sid_dir = _hook_session_dir(hook_outputs_dir, sid)
+                if sid_dir is None:
+                    # A missing directory is clean. An unsafe or unreadable entry is not.
+                    try:
+                        (hook_outputs_dir / sid).lstat()
+                    except OSError as exc:
+                        _failed(exc)
+                    else:
+                        files_pending = True
+                    continue
+
+                for directory, _, files in os.walk(sid_dir, topdown=False, onerror=_failed, followlinks=False):
+                    current_dir = Path(directory)
+                    if current_dir.resolve().parts != current_dir.parts:
+                        files_pending = True
+                        continue
+                    for name in files:
+                        _scrub_file(current_dir / name)
+                    try:
+                        current_dir.rmdir()
+                    except OSError as exc:
+                        _failed(exc)
+        except (OSError, RuntimeError) as exc:
+            _failed(exc)
+        return files_scrubbed, files_pending
+
     def burn_session(
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
     ) -> dict[str, Any]:
@@ -788,7 +865,8 @@ class IncognitoEngine:
 
         with self._lock:
             leases = self._read_leases()
-            lease = leases.get(session_id)
+            lease = leases.get(session_id, {})
+            authorized_leases: dict[str, dict[str, Any]] = {}
             state_db = self.home_dir / "state.db"
             db = None
             try:
@@ -799,10 +877,14 @@ class IncognitoEngine:
 
             def _authorized(sid: str) -> bool:
                 if isinstance(leases.get(sid), dict):
+                    authorized_leases[sid] = leases[sid]
                     return True
                 if db is not None:
                     try:
-                        return _is_incognito_marker(db.get_session_model_config_value(sid, "incognito"))
+                        marker = db.get_session_model_config_value(sid, "incognito")
+                        if _is_incognito_marker(marker):
+                            authorized_leases[sid] = marker if isinstance(marker, dict) else {}
+                            return True
                     except Exception as exc:
                         logger.debug("Cannot check incognito marker for %s: %s", sid, exc)
                 return False
@@ -842,81 +924,32 @@ class IncognitoEngine:
                     db.close()
 
             rows_after = self._count_db_rows_for_ids(state_db, target_ids)
-            pending_burn = rows_after != 0
-            db_deleted = not pending_burn and (db_deleted or bool(rows_before))
+            db_deleted = rows_after == 0 and (
+                db_deleted or bool(rows_before) or bool(authorized_leases[session_id].get("db_deleted"))
+            )
+            files_scrubbed, files_pending = self._scrub_burn_files(target_ids)
+            pending_burn = rows_after != 0 or files_pending
 
-            # 2. Scrub disk files (transcripts and hook outputs)
-            settings = self.get_settings()
-            zero_fill = settings.get("zero_fill_files", True)
-            files_scrubbed = 0
-
-            sessions_dir = (self.home_dir / "sessions").resolve()
-            hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
-
-            def _scrub_file(file_path: Path) -> None:
-                nonlocal files_scrubbed
-                try:
-                    if file_path.resolve().parts != file_path.parts:
-                        return
-                    info = file_path.lstat()
-                    if not stat.S_ISREG(info.st_mode):
-                        return
-                    if zero_fill and info.st_nlink == 1 and info.st_size > 0:
-                        with file_path.open("r+b") as handle:
-                            opened = os.fstat(handle.fileno())
-                            if not os.path.samestat(info, opened) or opened.st_nlink != 1:
-                                return
-                            handle.write(b"\x00" * opened.st_size)
-                            handle.flush()
-                            os.fsync(handle.fileno())
-                    file_path.unlink()
-                    files_scrubbed += 1
-                except FileNotFoundError:
-                    pass
-                except (OSError, RuntimeError) as exc:
-                    logger.debug("Failed to scrub file %s: %s", file_path, exc)
-
-            for sid in target_ids:
-                for path in _session_files(sessions_dir, sid):
-                    _scrub_file(path)
-                for path in _flat_hook_files(hook_outputs_dir, sid):
-                    _scrub_file(path)
-
-                sid_dir = _hook_session_dir(hook_outputs_dir, sid)
-                if sid_dir is not None:
-                    for directory, _, files in os.walk(sid_dir, topdown=False, followlinks=False):
-                        current_dir = Path(directory)
-                        if current_dir.resolve().parts != current_dir.parts:
-                            continue
-                        for name in files:
-                            _scrub_file(current_dir / name)
-                        try:
-                            current_dir.rmdir()
-                        except OSError:
-                            pass
-
-            # 3. Clear RAM vault
             vault_keys_cleared = 0
-            for sid in target_ids:
-                v = self._vaults.pop(sid, {})
-                self._reverse_vaults.pop(sid, None)
-                self._kind_counters.pop(sid, None)
-                vault_keys_cleared += len(v)
-
-            # 4. Remove active leases, or retain a pending_burn tombstone if Gateway still holds
-            #    an active turn admission lock on the sessions row so sweep/retry finishes it.
             if pending_burn:
-                leases[session_id] = {
-                    **(lease if isinstance(lease, dict) else {}),
-                    "session_id": session_id,
-                    "mode": lease.get("mode", "standard") if isinstance(lease, dict) else "standard",
-                    "pending_burn": True,
-                    "expires_at": 0,
-                    "lineage_ids": sorted(target_ids),
-                }
+                # A deleted DB row may have been the only marker for a lineage member.
+                # Retain a lease for every authorized target so all can finish cleanup.
+                lineage = sorted(target_ids)
+                for sid in target_ids:
+                    leases[sid] = {
+                        **authorized_leases[sid],
+                        "session_id": sid,
+                        "pending_burn": True,
+                        "expires_at": 0,
+                        "lineage_ids": lineage,
+                        "db_deleted": db_deleted,
+                    }
             else:
                 for sid in target_ids:
                     leases.pop(sid, None)
+                    vault_keys_cleared += len(self._vaults.pop(sid, {}))
+                    self._reverse_vaults.pop(sid, None)
+                    self._kind_counters.pop(sid, None)
             self._write_leases(leases)
 
             if pending_burn and _retry_attempt == 0:
@@ -933,18 +966,18 @@ class IncognitoEngine:
                 "reason": reason,
                 "db_deleted": db_deleted,
                 "pending_burn": pending_burn,
+                "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
+            audit = self._read_audit()
+            if not pending_burn:
+                audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
+            audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
             if _retry_attempt == 0 or not pending_burn:
-                audit = self._read_audit()
-                if _retry_attempt == 0:
-                    audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
-                audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
-                receipts = audit.setdefault("receipts", [])
-                receipts.append(receipt)
-                self._write_audit(audit)
+                audit.setdefault("receipts", []).append(receipt)
+            self._write_audit(audit)
 
             return {
                 "ok": True,
@@ -952,6 +985,7 @@ class IncognitoEngine:
                 "reason": reason,
                 "db_deleted": db_deleted,
                 "pending_burn": pending_burn,
+                "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
@@ -1018,7 +1052,7 @@ class IncognitoEngine:
             swept_receipts = []
             for sid, reason in to_burn.items():
                 res = self.burn_session(sid, reason=reason)
-                if res.get("ok"):
+                if res.get("ok") and not res.get("pending_burn"):
                     swept_receipts.append(res)
 
             if swept_receipts:

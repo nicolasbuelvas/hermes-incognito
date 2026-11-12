@@ -133,7 +133,7 @@ def register(ctx: Any) -> None:
             if result.get("ok") and hasattr(ctx, "emit_to_session"):
                 try:
                     ctx.emit_to_session(sid, "state.changed", {
-                        "active": False, "burned": not result["pending_burn"]
+                        "active": result["pending_burn"], "burned": not result["pending_burn"]
                     })
                 except Exception:
                     pass
@@ -194,6 +194,8 @@ def register(ctx: Any) -> None:
         if not subcmd:
             if sid:
                 res = engine.toggle_session(sid)
+                if not res["ok"]:
+                    return res["error"]
                 _emit_state()
                 if res.get("mode") != "off":
                     return f"Incognito mode enabled ({res.get('mode')}) for session {sid}."
@@ -204,6 +206,8 @@ def register(ctx: Any) -> None:
         if subcmd == "status":
             summary = engine.status_summary(session_id=sid)
             curr = summary.get("current_session")
+            if curr and curr.get("pending_burn"):
+                return "Burn pending. Incognito protections are active while Hermes retries cleanup."
             if curr and curr.get("active"):
                 rem = (curr.get("remaining_seconds") or 0) // 60
                 return (
@@ -225,7 +229,9 @@ def register(ctx: Any) -> None:
                 ttl = int(parts[1])
 
             if sid:
-                engine.enable_session(sid, mode=mode, ttl_minutes=ttl)
+                res = engine.enable_session(sid, mode=mode, ttl_minutes=ttl)
+                if not res["ok"]:
+                    return res["error"]
                 _emit_state()
                 return f"Incognito mode enabled ({mode}) for session {sid}."
             engine.arm_next_session(mode=mode, ttl_minutes=ttl)
@@ -234,7 +240,9 @@ def register(ctx: Any) -> None:
         if subcmd == "strict":
             ttl = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             if sid:
-                engine.enable_session(sid, mode="strict", ttl_minutes=ttl)
+                res = engine.enable_session(sid, mode="strict", ttl_minutes=ttl)
+                if not res["ok"]:
+                    return res["error"]
                 _emit_state()
                 return f"Strict clean-room incognito mode enabled for session {sid}."
             engine.arm_next_session(mode="strict", ttl_minutes=ttl)
@@ -250,12 +258,14 @@ def register(ctx: Any) -> None:
                 return f"Burn refused: {res['error']}"
             _emit_state()
             if res["pending_burn"]:
-                return f"Burn pending for session {sid}. Hermes will retry database cleanup."
+                return f"Burn pending for session {sid}. Hermes will retry cleanup."
             return f"Incognito session {sid} burned. Files scrubbed: {res['files_scrubbed']}. (Receipt: {res['receipt_id']})"
 
         if subcmd in ("off", "disable"):
             if sid:
-                engine.disable_session(sid)
+                res = engine.disable_session(sid)
+                if not res["ok"]:
+                    return res["error"]
                 _emit_state()
                 return f"Incognito mode disabled for session {sid}. History retained."
             engine.disarm_next_session()
@@ -455,7 +465,7 @@ def register(ctx: Any) -> None:
             elif not res["ok"]:
                 print(f"Burn refused: {res['error']}")
             elif res["pending_burn"]:
-                print(f"Burn pending for session {target_sid}. Hermes will retry database cleanup.")
+                print(f"Burn pending for session {target_sid}. Hermes will retry cleanup.")
             else:
                 print(
                     f"✓ Burned session {target_sid}: DB deleted={res.get('db_deleted')}, "
@@ -518,8 +528,8 @@ def register(ctx: Any) -> None:
             ttl = p.get("ttl_minutes")
             redact = p.get("redact_pii")
             if sid and sid != "new":
-                engine.toggle_session(sid, mode=mode, ttl_minutes=ttl)
-                return engine.status_summary(sid)
+                result = engine.toggle_session(sid, mode=mode, ttl_minutes=ttl)
+                return engine.status_summary(sid) if result["ok"] else result
             if mode == "off" or engine.get_armed_state():
                 engine.disarm_next_session()
             else:
