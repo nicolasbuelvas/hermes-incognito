@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -112,6 +113,7 @@ except ImportError:
             return {}
 
 logger = logging.getLogger(__name__)
+_ENGINE_MODULE_KEY = f"hermes_incognito_engine:{Path(__file__).resolve()}"
 
 VALID_MODES: tuple[str, ...] = ("off", "standard", "strict")
 
@@ -225,8 +227,6 @@ class IncognitoEngine:
         self.config: dict[str, Any] = {}
         # RAM-only masking vaults (placeholder <-> original), one per session. Never persisted.
         self._vaults: dict[str, pii.Vault] = {}
-        # Saved chats that can still go back to Incognito: session_id -> undo record (RAM only).
-        self._saved: dict[str, dict[str, Any]] = {}
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -289,8 +289,14 @@ class IncognitoEngine:
         return self.data_dir / "audit.json"
 
     def _read_leases(self) -> dict[str, Any]:
-        data = read_json_or_empty(self._leases_path())
-        return data if isinstance(data, dict) else {}
+        try:
+            with self._leases_path().open(encoding="utf-8") as stream:
+                data = json.load(stream)
+        except FileNotFoundError:
+            return {}
+        if not isinstance(data, dict) or any(not isinstance(lease, dict) for lease in data.values()):
+            raise ValueError("Invalid Incognito lease ledger")
+        return data
 
     def _write_leases(self, leases: dict[str, Any]) -> None:
         atomic_json_write(self._leases_path(), leases)
@@ -401,9 +407,13 @@ class IncognitoEngine:
         self, mode: str = "standard", ttl_minutes: int | None = None, redact_pii: bool | None = None
     ) -> dict[str, Any]:
         """Arm the next session to automatically start in incognito mode."""
+        if ttl_minutes is not None and (type(ttl_minutes) is not int or ttl_minutes < 0):
+            return {"ok": False, "error": "ttl_minutes must be a non-negative integer."}
+        if redact_pii is not None and type(redact_pii) is not bool:
+            return {"ok": False, "error": "redact_pii must be a boolean."}
         with self._locked():
             if mode not in ("standard", "strict"):
-                raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
+                return {"ok": False, "error": "Invalid Incognito mode."}
             settings = self.get_settings()
             ttl = ttl_minutes if ttl_minutes is not None else settings.get("default_ttl_minutes", 60)
             redact = redact_pii if redact_pii is not None else settings.get("redact_outbound_pii", False)
@@ -488,8 +498,12 @@ class IncognitoEngine:
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
         if mode not in ("standard", "strict"):
-            raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
+            return {"ok": False, "error": "Invalid Incognito mode."}
 
+        if ttl_minutes is not None and (type(ttl_minutes) is not int or ttl_minutes < 0):
+            return {"ok": False, "error": "ttl_minutes must be a non-negative integer."}
+        if redact_pii is not None and type(redact_pii) is not bool:
+            return {"ok": False, "error": "redact_pii must be a boolean."}
         with self._locked():
             leases = self._read_leases()
             existing = leases.get(session_id)
@@ -532,11 +546,15 @@ class IncognitoEngine:
                 }
                 newly_protected = True
 
-            if SessionDB is not None and not self._set_history_state({session_id: lease}):
-                return {"ok": False, "error": "Could not hide the chat in history. Try again."}
-
-            leases[session_id] = lease
-            self._write_leases(leases)
+            affected = {session_id: lease}
+            for sid in lease.get("lineage_ids", []):
+                member = leases.get(sid)
+                if (sid != session_id and _is_ancestor_lease(member)
+                        and member.get("subagent_of") and not member.get("pending_burn")):
+                    affected[sid] = {**member, "mode": mode, "redact_pii": lease.get("redact_pii")}
+            leases.update(affected)
+            if not self._set_history_state(affected, commit=lambda: self._write_leases(leases)):
+                return {"ok": False, "error": "Could not activate Incognito. Try again."}
             if newly_protected:
                 self._finish_save(session_id)
                 audit = self._read_audit()
@@ -574,21 +592,25 @@ class IncognitoEngine:
                     and _is_ancestor_lease(leases.get(sid))
                     and not leases[sid].get("pending_burn")
                 ]
-            if SessionDB is not None and not self._set_history_state(dict.fromkeys(released)):
-                return {"ok": False, "error": "Could not update chat history. Try again."}
-
             for sid in released:
                 leases.pop(sid, None)
+            if not self._set_history_state(dict.fromkeys(released), commit=lambda: self._write_leases(leases)):
+                return {"ok": False, "error": "Could not update chat history. Try again."}
+            for sid in released:
                 self._drop_vault(sid)
-            self._write_leases(leases)
 
             return {"ok": True, "session_id": session_id, "mode": "off", "action": "keep"}
 
-    def _set_history_state(self, markers: dict[str, Any]) -> bool:
+    def _set_history_state(self, markers: dict[str, Any], *, commit: Callable[[], None] | None = None) -> bool:
         """Update visibility and the Incognito marker, restoring previous values on failure."""
         state_db = self.home_dir / "state.db"
-        if not state_db.exists():
-            return True
+        if not state_db.exists() or (SessionDB is None and commit is not None):
+            try:
+                if commit is not None:
+                    commit()
+                return True
+            except OSError:
+                return False
         if SessionDB is None:
             return False
 
@@ -607,15 +629,25 @@ class IncognitoEngine:
                     # Visibility updates can affect the entire compression lineage.
                     for sid in previous:
                         marker = markers[sid]
+                        old_hidden, old_marker = previous[sid]
+                        if isinstance(marker, dict):
+                            inherited_hidden = old_marker.get("hidden_before_incognito", False) if isinstance(old_marker, dict) else old_hidden
+                            marker.setdefault("hidden_before_incognito", inherited_hidden)
                         db.patch_session_model_config(sid, {"incognito": marker})
                         if db.get_session_model_config_value(sid, "incognito") != marker:
                             raise RuntimeError("Incognito marker was not updated")
                     for sid in previous:
-                        hidden = markers[sid] is not None
+                        old_hidden, old_marker = previous[sid]
+                        hidden = markers[sid] is not None or (
+                            bool(old_marker.get("hidden_before_incognito", False)) if isinstance(old_marker, dict)
+                            else old_hidden
+                        )
                         db.set_session_hidden(sid, hidden)
                         row = db.get_session(sid)
                         if row is None or bool(row.get("hidden")) != hidden:
                             raise RuntimeError("Chat history visibility was not updated")
+                    if commit is not None:
+                        commit()
                 except Exception:
                     for sid, (hidden, marker) in previous.items():
                         try:
@@ -638,6 +670,8 @@ class IncognitoEngine:
         """Update inactivity TTL in minutes for an active incognito session."""
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
+        if ttl_minutes is not None and (type(ttl_minutes) is not int or ttl_minutes < 0):
+            return {"ok": False, "error": "ttl_minutes must be a non-negative integer."}
         with self._locked():
             leases = self._read_leases()
             if session_id not in leases:
@@ -672,18 +706,21 @@ class IncognitoEngine:
     ) -> dict[str, Any]:
         """Toggle incognito mode, disable when mode=='off', or switch mode in place."""
         clean_mode = (mode or "standard").strip().lower()
-        if clean_mode == "off":
-            return self.disable_session(session_id, action="keep")
-        if self.is_incognito(session_id):
-            current = self.get_session_state(session_id)
-            if current and current.get("mode") != clean_mode and clean_mode in ("standard", "strict"):
-                return self.enable_session(
-                    session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
-                )
-            return self.disable_session(session_id, action="keep")
-        return self.enable_session(
-            session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
-        )
+        if clean_mode not in VALID_MODES:
+            return {"ok": False, "error": "Invalid Incognito mode."}
+        with self._locked():
+            if clean_mode == "off":
+                return self.disable_session(session_id, action="keep")
+            if self.is_incognito(session_id):
+                current = self.get_session_state(session_id)
+                if current and current.get("mode") != clean_mode and clean_mode in ("standard", "strict"):
+                    return self.enable_session(
+                        session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+                    )
+                return self.disable_session(session_id, action="keep")
+            return self.enable_session(
+                session_id, mode=clean_mode, ttl_minutes=ttl_minutes, redact_pii=redact_pii
+            )
 
     # -------------------------------------------------------------------------
     # 9. is_incognito
@@ -755,7 +792,7 @@ class IncognitoEngine:
                 "redactions": lease.get("redactions", 0),
                 "redact_pii": lease.get("redact_pii", False),
                 "started_at": lease.get("started_at"),
-                "masked_counts": self._vaults[session_id].counts() if session_id in self._vaults else {},
+                "masked_counts": self.masked_counts(session_id),
             }
 
     # -------------------------------------------------------------------------
@@ -794,8 +831,9 @@ class IncognitoEngine:
             if isinstance(lease, dict) and not lease.get("pending_burn") and not _is_ancestor_lease(lease):
                 now = time.time()
                 leases[session_id]["last_activity"] = now
-                if not leases[session_id].get("owner_pid"):
-                    leases[session_id]["owner_pid"] = os.getpid()
+                owner = lease.get("owner_pid")
+                if not owner or (owner != os.getpid() and not _is_pid_alive(owner)):
+                    lease["owner_pid"] = os.getpid()
                 ttl = leases[session_id].get("ttl_minutes", 0)
                 if ttl > 0:
                     leases[session_id]["expires_at"] = now + (ttl * 60)
@@ -1136,10 +1174,22 @@ class IncognitoEngine:
                 for sid in target_ids:
                     leases[sid]["db_deleted"] = db_deleted
             else:
+                saved = self._read_saved()
+                remaining_saved = {
+                    sid: record for sid, record in saved.items()
+                    if sid not in target_ids and not (
+                        isinstance(record, dict) and target_ids.intersection(record.get("leases") or {})
+                    )
+                }
+                if remaining_saved != saved:
+                    try:
+                        self._write_saved(remaining_saved)
+                    except OSError:
+                        pending_burn = True
                 for sid in target_ids:
-                    leases.pop(sid, None)
-                    self._saved.pop(sid, None)
                     vault_keys_cleared += self._drop_vault(sid)
+                    if not pending_burn:
+                        leases.pop(sid, None)
             self._write_leases(leases)
 
             if pending_burn and _retry_attempt == 0:
@@ -1166,7 +1216,12 @@ class IncognitoEngine:
                 audit["sessions_burned"] = audit.get("sessions_burned", 0) + 1
             audit["files_scrubbed"] = audit.get("files_scrubbed", 0) + files_scrubbed
             if _retry_attempt == 0 or not pending_burn:
-                audit.setdefault("receipts", []).append(receipt)
+                receipts = audit.setdefault("receipts", [])
+                receipts.append(receipt)
+                if not pending_burn:
+                    for sid in target_ids - {session_id}:
+                        digest = hashlib.sha256(sid.encode("utf-8")).hexdigest()
+                        receipts.append({**receipt, "session_hash": digest, "receipt_id": digest[:16]})
             self._write_audit(audit)
 
             if not pending_burn and self.on_burn_complete is not None:
@@ -1197,7 +1252,12 @@ class IncognitoEngine:
         """Sweep expired TTL leases and orphaned sessions from dead processes."""
         with self._locked():
             now = time.time()
+            for sid, record in self._read_saved().items():
+                if isinstance(record, dict) and now >= float(record.get("undo_until") or 0):
+                    self._finish_save(sid)
             leases = self._read_leases()
+            for sid in list(self._vaults):
+                self._current_vault(sid)
             to_burn: dict[str, str] = {}
 
             for sid, lease in leases.items():
@@ -1303,7 +1363,7 @@ class IncognitoEngine:
             elif (hook_outputs_dir / session_id).is_symlink():
                 hook_files_found += 1
 
-            ram_vault_entries = len(self._vaults.get(session_id, {}))
+            ram_vault_entries = len(self._current_vault(session_id) or {})
             leases = self._read_leases()
             active_lease = session_id in leases
 
@@ -1350,6 +1410,7 @@ class IncognitoEngine:
             return self._session_status(session_id)
         with self._locked():
             current_state = self.get_session_state(session_id) if session_id else None
+            saved = self.saved_state(session_id) if session_id else None
             armed = self.get_armed_state()
             leases = self._read_leases()
             active_leases = {
@@ -1369,7 +1430,8 @@ class IncognitoEngine:
                 "session_state": current_state,
                 "current_session": current_state,
                 "armed": armed,
-                "saved": self.saved_state(session_id) if session_id else None,
+                "saved": saved,
+                "burned": bool(session_id and not current_state and not saved and self._burned_in_audit(session_id, audit)),
                 "active_count": len(active_leases),
                 "active_sessions": [self._mask_id(sid) for sid in active_leases.keys()],
                 "audit": audit,
@@ -1690,7 +1752,32 @@ class IncognitoEngine:
                     redact = self.get_settings().get("redact_outbound_pii", False)
                 return bool(redact)
             saved = self._saved_record(session_id)
-            return bool(saved and saved.get("redact_pii"))
+            if not saved:
+                state_db = self.home_dir / "state.db"
+                if SessionDB is None or not state_db.exists():
+                    return False
+                db = SessionDB(db_path=state_db)
+                try:
+                    marker = db.get_session_model_config_value(session_id, "incognito")
+                finally:
+                    db.close()
+                return bool(marker.get("redact_pii", True)) if isinstance(marker, dict) else bool(marker)
+            member = saved["leases"].get(session_id, {})
+            return bool(member.get("redact_pii", saved.get("redact_pii")))
+
+    @staticmethod
+    def _burned_in_audit(session_id: str, audit: dict[str, Any]) -> bool:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        return any(rec.get("session_hash") == digest and not rec.get("pending_burn")
+                   for rec in audit.get("receipts", []))
+
+    def _current_vault(self, session_id: str) -> pii.Vault | None:
+        vault = self._vaults.get(session_id)
+        if vault is not None and session_id not in self._read_leases():
+            if self._saved_record(session_id) is None:
+                self._drop_vault(session_id)
+                return None
+        return vault
 
     def _vault_for(self, session_id: str) -> pii.Vault:
         vault = self._vaults.get(session_id)
@@ -1710,13 +1797,13 @@ class IncognitoEngine:
 
     def get_vault_entry(self, session_id: str, placeholder: str) -> str | None:
         with self._locked():
-            vault = self._vaults.get(session_id)
+            vault = self._current_vault(session_id)
             return vault.get(placeholder) if vault is not None else None
 
     def masked_counts(self, session_id: str) -> dict[str, int]:
         """Highest placeholder number per kind. Content-free; Desktop numbers after these."""
         with self._locked():
-            vault = self._vaults.get(session_id)
+            vault = self._current_vault(session_id)
             return vault.counts() if vault is not None else {}
 
     def _count_redactions(self, session_id: str, count: int) -> None:
@@ -2070,15 +2157,10 @@ class IncognitoEngine:
             # Keep the lease until both the undo record and the history update are durable.
             try:
                 self._write_saved({**saved, session_id: record})
-                if not self._set_history_state(dict.fromkeys(snapshot)):
+                remaining = {sid: entry for sid, entry in leases.items() if sid not in snapshot}
+                if not self._set_history_state(dict.fromkeys(snapshot), commit=lambda: self._write_leases(remaining)):
                     self._write_saved(saved)
                     return {"ok": False, "error": "Could not save the chat to history. Try again."}
-                try:
-                    self._write_leases({sid: entry for sid, entry in leases.items() if sid not in snapshot})
-                except OSError:
-                    if self._set_history_state(snapshot):
-                        self._write_saved(saved)
-                    raise
             except OSError:
                 return {"ok": False, "error": "Could not finish saving the chat. Try again."}
             return {
@@ -2118,12 +2200,8 @@ class IncognitoEngine:
                     lease["expires_at"] = now + ttl * 60 if ttl > 0 else None
                 leases[sid] = lease
                 restored[sid] = lease
-            if not self._set_history_state(restored):
+            if not self._set_history_state(restored, commit=lambda: self._write_leases(leases)):
                 return {"ok": False, "error": "Could not restore Incognito in chat history. Try again."}
-            try:
-                self._write_leases(leases)
-            except OSError:
-                return {"ok": False, "error": "Could not finish restoring Incognito. Try again."}
             saved = self._read_saved()
             saved.pop(session_id, None)
             try:
@@ -2159,6 +2237,7 @@ class IncognitoEngine:
             "undo_remaining_seconds": max(0, int(float(rec.get("undo_until") or 0) - time.time())),
             "mode": rec.get("mode"),
             "redact_pii": bool(rec.get("redact_pii")),
+            "masked_counts": self.masked_counts(session_id),
         }
 
     def propagate_saved_compaction(self, old_session_id: str, new_session_id: str) -> bool:
@@ -2203,24 +2282,27 @@ class IncognitoEngine:
 # -----------------------------------------------------------------------------
 
 _ENGINE_LOCK = threading.Lock()
-_ENGINE_INSTANCE: IncognitoEngine | None = None
-_ENGINE_HOME: str | None = None
+_ENGINES: dict[str, IncognitoEngine] = {}
 
 
 def get_engine(home_dir: Path | str | None = None) -> IncognitoEngine:
     """Retrieve or create the IncognitoEngine singleton."""
-    global _ENGINE_INSTANCE, _ENGINE_HOME
-    current_home = str(Path(home_dir).expanduser().resolve()) if home_dir else os.environ.get("HERMES_HOME", "")
+    shared = sys.modules.setdefault(_ENGINE_MODULE_KEY, sys.modules[__name__])
+    if shared is not sys.modules[__name__]:
+        return shared.get_engine(home_dir)
+    current_home = str(Path(home_dir or get_hermes_home()).expanduser().resolve())
     with _ENGINE_LOCK:
-        if _ENGINE_INSTANCE is None or (current_home and current_home != _ENGINE_HOME):
-            _ENGINE_INSTANCE = IncognitoEngine(home_dir=home_dir)
-            _ENGINE_HOME = current_home
-        return _ENGINE_INSTANCE
+        engine = _ENGINES.get(current_home)
+        if engine is None:
+            engine = _ENGINES[current_home] = IncognitoEngine(home_dir=current_home)
+        return engine
 
 
 def reset_engine() -> None:
-    """Reset the cached engine singleton."""
-    global _ENGINE_INSTANCE, _ENGINE_HOME
+    """Reset the cached engine instances."""
+    shared = sys.modules.get(_ENGINE_MODULE_KEY)
+    if shared is not None and shared is not sys.modules[__name__]:
+        shared.reset_engine()
+        return
     with _ENGINE_LOCK:
-        _ENGINE_INSTANCE = None
-        _ENGINE_HOME = None
+        _ENGINES.clear()

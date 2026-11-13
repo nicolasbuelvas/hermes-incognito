@@ -338,3 +338,15 @@ test('a completed burn event clears only the deleted chat from Desktop memory', 
   assert.equal(getLastSend(), null)
   assert.equal(vaultFor('other').size, 1)
 })
+
+test('a saved chat reserves backend marker numbers and drops its vault when a burn is observed', async () => {
+  setFocused('saved-chat')
+  let current = status({ active: false, saved: { redact_pii: true, masked_counts: { EMAIL: 1 } } })
+  const send = makeMaskingMiddleware(fakeCtx(() => current))
+  assert.equal((await send({ text: 'new@example.org' })).text, '[EMAIL_2]')
+  const vault = vaultFor('saved-chat')
+  assert.equal(vault.size, 1)
+  current = { ok: true, burned: true }
+  assert.equal(await send({ text: 'hello' }), null)
+  assert.equal(vault.size, 0)
+})

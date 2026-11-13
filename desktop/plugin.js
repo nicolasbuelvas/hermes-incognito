@@ -76,7 +76,7 @@ const COPY = {
   offline: 'The Incognito backend is not running. Enable it with: hermes plugins enable incognito',
   hintTitle: 'Incognito is available',
   hintBody:
-    "Chat without leaving a trace. Standard hides the chat and deletes it when you're done. Strict also keeps your profile and notes away from the model.",
+    "Standard hides the chat and supports local cleanup. Strict also keeps your profile and notes away from the model.",
   hintTry: 'Try Standard',
   hintCompare: 'Compare levels',
   hintDismiss: 'Dismiss',
@@ -609,7 +609,7 @@ export function maskingFor(status, sessionId) {
   if (sessionId) {
     const state = status.session_state || status.current_session
     if (state?.active) return { on: Boolean(state.redact_pii), counts: state.masked_counts || {} }
-    if (status.saved?.redact_pii) return { on: true, counts: {} }
+    if (status.saved?.redact_pii) return { on: true, counts: status.saved.masked_counts || {} }
     return { on: false, counts: {} }
   }
   const mode = status.armed?.mode ?? status.settings?.default_mode
@@ -632,7 +632,12 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
       const sessionId = getSessionId()
       let masking = null
       try {
-        masking = maskingFor(await fetch(ctx, sessionId), sessionId)
+        const status = await fetch(ctx, sessionId)
+        if (sessionId && status?.burned) {
+          forgetChat(sessionId)
+          return null
+        }
+        masking = maskingFor(status, sessionId)
       } catch {
         masking = null
       }
@@ -969,6 +974,7 @@ function useIncognitoStatus(ctx, sessionId, { poll = false } = {}) {
   const refresh = useCallback(async () => {
     const res = await fetchStatus(ctx, sessionId)
     if (res) {
+      if (sessionId && res.burned) forgetChat(sessionId)
       setStatus(res)
       setOffline(false)
     } else {
@@ -1428,7 +1434,7 @@ function SentToModelCard({ record, onDismiss }) {
         ? jsxs('div', {
             style: { marginTop: '8px', paddingTop: '8px', borderTop: '1px solid var(--ui-stroke-tertiary)' },
             children: [
-              jsx('div', { style: { ...caption, marginBottom: '4px' }, children: 'Exactly what the model received:' }),
+              jsx('div', { style: { ...caption, marginBottom: '4px' }, children: 'Text passed to Hermes after masking:' }),
               jsx('pre', {
                 'data-incognito': 'sent-text',
                 style: { ...mono, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: text.primary },
@@ -1486,17 +1492,26 @@ function DraftMaskPreview({ sessionId, counts }) {
   const [preview, setPreview] = useState(null)
   useEffect(() => {
     if (typeof window === 'undefined' || typeof host?.composer?.getDraft !== 'function') return undefined
-    const tick = () => {
+    let live = true
+    let reading = false
+    const tick = async () => {
+      if (reading) return
+      reading = true
       try {
-        const draft = host.composer.getDraft(sessionId || null)
-        setPreview(draft && draft.text ? previewDraft(draft.text, counts) : null)
+        const draft = await host.composer.getDraft(sessionId || null)
+        if (live) setPreview(draft ? previewDraft(draft, counts) : null)
       } catch {
-        setPreview(null)
+        if (live) setPreview(null)
+      } finally {
+        reading = false
       }
     }
     tick()
     const id = window.setInterval(tick, 700)
-    return () => window.clearInterval(id)
+    return () => {
+      live = false
+      window.clearInterval(id)
+    }
   }, [sessionId, counts])
   if (!preview || !preview.kinds.length) return null
   return jsxs('div', {
@@ -1889,10 +1904,26 @@ export default {
       refreshAll()
     })
     const unbind2 = ctx.onEvent?.('plugin.incognito.settings.changed', refreshAll)
+    let checkingVaults = false
+    const stopVaultCheck = ctx.setInterval?.(async () => {
+      if (checkingVaults || !vaults.size) return
+      checkingVaults = true
+      try {
+        for (const [sid, vault] of vaults) {
+          const status = await fetchStatus(ctx, sid)
+          if (vaults.get(sid) === vault && (status?.burned || maskingFor(status, sid)?.on === false)) {
+            forgetChat(sid)
+          }
+        }
+      } finally {
+        checkingVaults = false
+      }
+    }, 30000)
 
     ctx.onDispose(() => {
       if (typeof unbind1 === 'function') unbind1()
       if (typeof unbind2 === 'function') unbind2()
+      if (typeof stopVaultCheck === 'function') stopVaultCheck()
       stateListeners.clear()
       burnHosts.clear()
       saveHosts.clear()

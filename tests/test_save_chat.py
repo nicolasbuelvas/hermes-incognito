@@ -464,3 +464,100 @@ def test_completed_automatic_burn_notifies_desktop(eng, db, clock, action):
 
     assert ("auto", "state.changed", {"session_id": "auto", "active": False, "burned": True}) in ctx.events
     assert eng.verify_zero_trace("auto")["zero_trace"]
+
+
+@pytest.mark.parametrize("action", ["enable", "disable", "undo"])
+def test_ledger_write_failure_restores_history(eng, db, monkeypatch, action):
+    db.create_session("transaction")
+    if action in ("disable", "undo"):
+        assert eng.enable_session("transaction", redact_pii=True)["ok"]
+    if action == "undo":
+        assert eng.save_session("transaction")["ok"]
+    was_hidden = _hidden(db, "transaction")
+    previous = db.get_session_model_config_value("transaction", "incognito")
+    operations = {"enable": eng.enable_session, "disable": eng.disable_session, "undo": eng.undo_save}
+    with monkeypatch.context() as failure:
+        def fail(_):
+            raise OSError("simulated ledger write failure")
+        failure.setattr(eng, "_write_leases", fail)
+        assert not operations[action]("transaction")["ok"]
+    assert _hidden(db, "transaction") == was_hidden
+    assert db.get_session_model_config_value("transaction", "incognito") == previous
+    assert operations[action]("transaction")["ok"]
+
+
+def test_saved_chat_preserves_existing_hidden_state_and_reports_counts(eng, db):
+    db.create_session("already-hidden")
+    db.set_session_hidden("already-hidden", True)
+    assert eng.enable_session("already-hidden", redact_pii=True)["ok"]
+    eng.mask_text("already-hidden", EMAIL)
+    assert eng.save_session("already-hidden")["ok"]
+    assert _hidden(db, "already-hidden")
+    assert eng.saved_state("already-hidden")["masked_counts"] == {"EMAIL": 1}
+
+
+def test_burn_removes_stale_undo_and_other_engine_reconciles_its_vault(eng, db, monkeypatch):
+    _start(eng, db, "cross-process", redact_pii=True)
+    eng.mask_text("cross-process", EMAIL)
+    assert eng.save_session("cross-process")["ok"]
+    with monkeypatch.context() as failure:
+        def fail(_):
+            raise OSError("simulated stale undo record")
+        failure.setattr(eng, "_write_saved", fail)
+        assert eng.undo_save("cross-process")["ok"]
+    other = plugin_engine.IncognitoEngine(eng.home_dir)
+    assert not other.burn_session("cross-process")["pending_burn"]
+    assert eng.status_summary("cross-process")["burned"]
+    assert not eng.undo_save("cross-process")["ok"]
+    assert eng.get_vault_entry("cross-process", "[EMAIL_1]") is None
+
+
+def test_sweep_expires_saved_metadata_and_vault(eng, db, clock):
+    _start(eng, db, "expired-undo", redact_pii=True)
+    eng.mask_text("expired-undo", EMAIL)
+    assert eng.save_session("expired-undo")["ok"]
+    clock["now"] += 601
+    eng.sweep_expired()
+    assert "expired-undo" not in eng._read_saved()
+    assert "expired-undo" not in eng._vaults
+
+
+def test_active_helpers_follow_parent_changes_and_saved_helpers_keep_their_policy(eng, db):
+    _start(eng, db, "parent-policy", redact_pii=False)
+    eng.adopt_subagent("parent-policy", "helper-policy")
+    assert eng.enable_session("parent-policy", "strict", redact_pii=True)["ok"]
+    assert eng.get_session_state("helper-policy")["mode"] == "strict"
+    assert eng.masking_active("helper-policy")
+    assert eng.enable_session("parent-policy", "standard", redact_pii=False)["ok"]
+    assert eng.enable_session("helper-policy", "strict", redact_pii=True)["ok"]
+    assert eng.save_session("parent-policy")["ok"]
+    assert eng.masking_active("helper-policy")
+
+
+def test_existing_session_start_does_not_consume_next_chat(eng, db):
+    ctx = SimCtx()
+    plugin.register(ctx)
+    db.create_session("existing-chat")
+    eng.arm_next_session("strict", redact_pii=True)
+    ctx.hooks["on_session_start"][0](session_id="existing-chat")
+    ctx.hooks["pre_llm_call"][0](session_id="existing-chat", is_first_turn=False)
+    assert eng.get_armed_state() is not None
+    assert not eng.is_incognito("existing-chat")
+    ctx.hooks["pre_llm_call"][0](session_id="new-chat", is_first_turn=True)
+    assert eng.masking_active("new-chat")
+
+
+def test_corrupt_ledger_blocks_the_turn(eng, db):
+    ctx = SimCtx()
+    plugin.register(ctx)
+    _start(eng, db, "corrupt", redact_pii=True)
+    eng._leases_path().write_text("{", encoding="utf-8")
+    result = ctx.hooks["pre_llm_call"][0](session_id="corrupt", is_first_turn=False)
+    assert result["action"] == "block"
+
+
+def test_rest_rejects_invalid_privacy_settings():
+    assert not plugin_api.enable_session({"session_id": "invalid", "redact_pii": "false"})["ok"]
+    assert not plugin_api.enable_session({"session_id": "invalid", "ttl_minutes": "abc"})["ok"]
+    assert not plugin_api.enable_session({"session_id": "invalid", "ttl_minutes": -1})["ok"]
+    assert not plugin_api.arm_session({"mode": "invalid"})["ok"]

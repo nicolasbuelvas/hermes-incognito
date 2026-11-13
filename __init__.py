@@ -103,13 +103,7 @@ def register(ctx: Any) -> None:
     # 2. Register Hooks
     # -------------------------------------------------------------------------
     def on_session_start(session_id: str = "", **kwargs: Any) -> None:
-        """Initialize session state and sweep expired orphans."""
-        sid = _resolve_session_id(kwargs, session_id)
-        if sid:
-            try:
-                engine.consume_armed_session(sid)
-            except IncognitoActivationError:
-                logger.warning("Could not activate Incognito at session start; the first turn will retry.")
+        """Sweep expired sessions when Hermes initializes a conversation."""
         engine.sweep_expired()
 
     def pre_llm_call(session_id: str = "", is_first_turn: bool = False, **kwargs: Any) -> Any:
@@ -709,7 +703,9 @@ def register(ctx: Any) -> None:
             if mode == "off" or engine.get_armed_state():
                 engine.disarm_next_session()
             else:
-                engine.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
+                result = engine.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
+                if not result["ok"]:
+                    return result
             return engine.status_summary("")
 
         def rpc_enable(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
@@ -723,8 +719,7 @@ def register(ctx: Any) -> None:
             ttl = p.get("ttl_minutes")
             redact = p.get("redact_pii")
             result = engine.enable_session(
-                sid, mode=mode, ttl_minutes=int(ttl) if ttl is not None else None,
-                redact_pii=None if redact is None else bool(redact),
+                sid, mode=mode, ttl_minutes=ttl, redact_pii=redact,
             )
             return {**engine.status_summary(sid), "ok": True} if result.get("ok") else result
 
@@ -747,6 +742,8 @@ def register(ctx: Any) -> None:
 
         def rpc_arm(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
             p = params or {}
+            if "disarm" in p and type(p["disarm"]) is not bool:
+                return {"ok": False, "error": "disarm must be a boolean."}
             if p.get("disarm"):
                 return engine.disarm_next_session()
             mode = p.get("mode", "standard")
