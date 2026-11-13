@@ -23,7 +23,6 @@ import copy
 import importlib.util
 import json
 import sys
-import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -35,15 +34,6 @@ class _DownstreamExecutionError(Exception):
     def __init__(self, original: BaseException) -> None:
         super().__init__(str(original))
         self.original = original
-
-
-def install_fake_hermes_middleware(monkeypatch) -> None:
-    pkg = types.ModuleType("hermes_cli")
-    pkg.__path__ = []  # type: ignore[attr-defined]
-    mod = types.ModuleType("hermes_cli.middleware")
-    mod._DownstreamExecutionError = _DownstreamExecutionError  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
-    monkeypatch.setitem(sys.modules, "hermes_cli.middleware", mod)
 
 
 def load_plugin():
@@ -281,6 +271,8 @@ class SimHermes:
                 break
             else:
                 return {"error": "retries exhausted"}
+            if not isinstance(response, dict):
+                return {"blocked": response.choices[0].message.content}
             message = dict(response["choices"][0]["message"])
             msgs.append(message)
             reply = message

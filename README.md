@@ -1,6 +1,6 @@
 # Hermes Incognito
 
-Zero-trace ephemeral sessions, outbound PII redaction, tool mutation guards, and cryptographic forensic verification for Hermes Agent CLI, TUI, Gateway, and Desktop.
+Ephemeral sessions, outbound PII redaction, tool mutation guards, and local cleanup checks for Hermes Agent CLI, TUI, Gateway, and Desktop.
 
 ## Architecture
 
@@ -22,10 +22,10 @@ Hermes Incognito operates as an in-process security and privacy layer intercepti
 │ • on_session_end             │ • pre_llm_call (Middleware)  │
 │ • post_compaction            │ • RAM-Only PII Vault         │
 ├──────────────────────────────┴──────────────────────────────┤
-│ Secure Deletion & Forensic Verifier                         │
+│ Local Cleanup & Verification                         │
 │ • SQLite row removal (`state.db`)                           │
 │ • File zero-filling & unlinking (`sessions/*.jsonl`)        │
-│ • Cryptographic receipt generation                          │
+│ • Cleanup receipt generation                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,7 +33,7 @@ Hermes Incognito operates as an in-process security and privacy layer intercepti
 2. **Tool Mutation Guard:** Active incognito chats intercept `pre_tool_call`. Attempts to mutate persistent storage (`memory`, `skill_manage`) or inspect historical chats (`session_search`, `cronjob_manage` in strict mode) are blocked with structured explanations returned to the agent.
 3. **RAM-Only Middleware:** In strict mode, user profiles and personal notes are stripped from outbound prompts in RAM before reaching model providers. With **Mask personal details** on, personal details become placeholders such as `[EMAIL_1]` before anything is sent, and a send that can't be checked is blocked. See [Masking personal details](#masking-personal-details).
 4. **Lifecycle & Compaction Tracking:** When context compaction occurs, incognito status, TTL leases, and active RAM vault tables transfer to the continuation session. The compacted sessions become ancestors: they have no TTL of their own, are never swept or finalized on their own, and are deleted together with the live continuation when it is burned.
-5. **Secure Scrubbing:** Upon chat completion or TTL idle expiration, sessions are burned: associated SQLite database rows are deleted, transcript files are overwritten with zeros and unlinked, hook output caches are removed, and volatile RAM vaults are wiped.
+5. **Local Cleanup:** With automatic cleanup enabled, closing a chat starts cleanup. A sweep can clean up chats after their idle TTL expires: associated SQLite database rows are deleted, transcript files are overwritten with zeros and unlinked, hook output caches are removed, and volatile RAM vaults are wiped.
 
 ---
 
@@ -51,7 +51,7 @@ Hermes Incognito operates as an in-process security and privacy layer intercepti
 | **Mask personal details (fail-closed)** | Disabled | Optional (`redact_pii`) | Optional (`redact_pii`); on by default when Desktop starts a Strict chat |
 | **Provider Non-Retention Hints (ZDR)** | No | Attached | Attached |
 | **Zero-Fill Prior to Unlink** | No | Yes | Yes |
-| **Cryptographic Zero-Trace Audit** | N/A | Supported | Supported |
+| **Local Cleanup Check** | N/A | Supported | Supported |
 
 ---
 
@@ -98,7 +98,7 @@ hermes incognito sweep
 hermes incognito save <session_id>
 hermes incognito undo <session_id>
 
-# Perform forensic zero-trace audit on a session
+# Check local session artifacts
 hermes incognito verify <session_id>
 ```
 
@@ -144,27 +144,27 @@ When used with Hermes Desktop, Incognito provides native integration:
 The Desktop UI uses the Hermes UI kit (`Badge`, `SegmentedControl`, `ToggleRow`, `Tip`, `ConfirmDialog`) and theme variables, so it follows the active Hermes theme. Newer kit pieces are feature-detected, with plain fallbacks on older Desktop builds.
 
 - **First-run hint (`COMPOSER_AREAS.top`):** A dismissible note above the composer explains the two levels and offers **Try Standard** and **Compare levels**. It stays dismissed after you close it, try a level, or open the Incognito page.
-- **Chat banner (`COMPOSER_AREAS.top`):** While a chat is in Incognito, shows the level (with a tooltip that explains it), the auto-delete deadline and time left (for example, `Deleted after 60 min idle · 42 min left`), and whether personal details are masked. Buttons: **Switch to Strict/Standard**, **Save this chat…**, and **Delete now…**. After saving, the banner reads **Saved to your history** with **Return to Incognito** until the undo window ends.
+- **Chat banner (`COMPOSER_AREAS.top`):** While a chat is in Incognito, shows the level (with a tooltip that explains it), the time until the chat becomes eligible for cleanup on a sweep, and whether personal details are masked. Buttons: **Switch to Strict/Standard**, **Save this chat…**, and **Delete now…**. After saving, the banner reads **Saved to your history** with **Return to Incognito** until the undo window ends.
 - **Status bar (`STATUSBAR_AREAS.right`):** `Incognito off`, `Incognito · Standard`, `Incognito · Strict`, or `Next chat: Incognito · …`, with a tooltip. Clicking it turns Incognito on (Standard), or offers to save the chat (asks first, with Undo).
 - **Keyboard shortcut (`KEYBINDS_AREA`):** `Ctrl+Shift+I` (`Cmd+Shift+I` on macOS) turns Incognito on or off for the focused chat. The toast states the resulting state.
 - **Command palette (`PALETTE_AREA`):** Turn on or off, use Standard, use Strict, start the next new chat in Incognito, delete this chat, and open the privacy levels page.
-- **Incognito page (`ROUTES_AREA` and `SIDEBAR_NAV_AREA`):** A level picker (Normal, Standard, Strict) for the focused chat, with what each level protects, a **Mask personal details** switch, a **Next new chat** picker, a **When to use each level** guide, and a collapsed **Advanced** section with content-free totals and the leftover check (zero-trace verifier).
+- **Incognito page (`ROUTES_AREA` and `SIDEBAR_NAV_AREA`):** A level picker (Normal, Standard, Strict) for the focused chat, with what each level protects, a **Mask personal details** switch, a **Next new chat** picker, a **When to use each level** guide, and a collapsed **Advanced** section with content-free totals and the local cleanup check.
 - **Delete confirmation:** Every delete entry point asks first: "Delete this chat permanently?".
 - **Save confirmation:** Every way of leaving Incognito while keeping the chat (banner, status bar, shortcut, level picker, palette) asks "Save this chat to your history?" and then shows an **Undo** toast.
 - **Masking feedback (`COMPOSER_AREAS.middleware` and `underside`):** With masking on, Desktop masks the message in the composer before Hermes receives it. While you type, a strip lists what will be masked. After sending, a card animates each value into its placeholder (Hermes' decode effect; static under reduced motion), shows "3 details masked before sending", and expands to **Sent to model** with the exact text the model received. **Show values** reveals the originals from this window's memory only.
 
 ---
 
-## Forensic Zero-Trace Verification Walkthrough
+## Local cleanup and verification
 
-A manual burn or idle TTL cleanup clears local artifacts associated with the incognito session:
+A manual burn or an eligible sweep clears the tracked local artifacts associated with the incognito session. The plugin sweeps on session start and supports a manual sweep. The idle TTL marks eligibility for cleanup.
 
 1. **Database Scrubbing:** Uses Hermes `SessionDB.delete_session()` for authorized incognito rows. If Hermes defers deletion during an active write or an artifact cannot be removed, the lease and privacy protections remain active while cleanup retries.
 2. **File Overwrite & Unlink:** Locates JSONL transcripts in `$HERMES_HOME/sessions/` and temporary artifacts in `$HERMES_HOME/hook_outputs/`. Overwrites regular, unshared files with zeros before unlinking when zero fill is enabled. Skips symlinks.
 3. **Vault Depletion:** Discards the in-memory placeholder maps used for masking.
-4. **Audit Receipt:** Emits a content-free cryptographic receipt containing timestamp, verification checksum, and counts of cleared artifacts.
+4. **Audit Receipt:** Records a timestamp, a hash of the session ID, and counts of cleared artifacts. The hash identifies the session associated with the receipt.
 
-To verify zero trace at any time:
+To check for tracked artifacts at any time:
 
 ```bash
 hermes incognito verify <session_id>
@@ -186,6 +186,8 @@ Sample audit report:
 ```
 
 ---
+
+The `zero_trace` field reports whether the check found any matching rows in the `sessions` and `messages` tables, known transcript or hook files, a vault in the current process, or an active lease. Backups, SQLite journal contents, filesystem blocks, other processes’ memory, and provider storage are outside the scope of this check.
 
 ## Masking personal details
 
@@ -209,7 +211,7 @@ Where it applies, in order:
 2. **`pre_llm_call`:** the turn's messages are masked in place before Hermes titles, compacts, or stores them (CLI, TUI, gateway).
 3. **`transform_tool_result`:** tool output is masked before it joins the conversation.
 4. **`llm_request` middleware:** every text field of the provider request is masked: messages, system prompt, tool-call arguments, tool results, Responses and Anthropic blocks. Images, audio, and files are replaced with a note.
-5. **`llm_execution` gate:** the final payload of every attempt (retries included) is masked again and re-checked. If anything still looks like a personal detail, or masking fails, the call is stopped before the network: "Incognito didn't send this message because it couldn't confirm your personal details were masked. Nothing left this computer."
+5. **`llm_execution` gate:** the final payload of every attempt (retries included) is masked again and re-checked. If anything still looks like a personal detail, or masking fails, the call is stopped before the network: "Incognito didn't send this message because it couldn't confirm your personal details were masked."
 6. **Helper agents** started from the chat inherit Incognito, masking, and the same placeholders.
 
 Model replies keep the placeholders. The real values are never put back into anything Hermes sends or saves. The placeholder map lives in memory only, is shared across compaction, and is wiped on burn. Desktop keeps its own copy in the window's memory so **Show values** works locally.
@@ -230,9 +232,9 @@ Started a chat in Incognito and want to keep it? Use **Save this chat…** (Desk
 
 Hermes Incognito is designed to provide high-assurance defense against **local inspection, persistence leakage, and unintentional profile pollution**. To maintain rigorous engineering honesty, the following boundaries must be understood:
 
-1. **Local Host Scope:** Incognito guarantees that session history, tool mutations, and temporary spill files are scrubbed from the local host system. It cannot prevent host-level memory dump inspection while a process is actively executing with administrative privileges.
+1. **Local Host Scope:** Incognito attempts to remove the tracked local session rows and files. A pending burn indicates that cleanup needs another attempt. It cannot prevent host-level memory dump inspection while a process is actively executing with administrative privileges.
 2. **Upstream Provider Retention:** Outbound prompts travel to configured model provider APIs over encrypted TLS. While this plugin attaches Zero Data Retention (ZDR) request hints where supported, the upstream provider's logging, training, and data retention policies remain governed by your provider account agreement.
-3. **Hardware Storage Media (SSDs):** When `zero_fill_files` is enabled, the plugin overwrites files prior to unlinking. However, on modern Solid-State Drives (SSDs) utilizing wear-leveling algorithms or Copy-on-Write (CoW) filesystems (such as Btrfs, APFS, or ZFS), physical flash blocks may retain historical data until garbage collection cycles occur. For absolute hardware guarantees, run Hermes within encrypted disk volumes (LUKS, BitLocker, FileVault).
+3. **Hardware Storage Media (SSDs):** When `zero_fill_files` is enabled, the plugin overwrites files prior to unlinking. However, on modern Solid-State Drives (SSDs) utilizing wear-leveling algorithms or Copy-on-Write (CoW) filesystems (such as Btrfs, APFS, or ZFS), physical flash blocks may retain historical data until garbage collection cycles occur. Disk encryption can protect historical blocks at rest.
 4. **Pattern-based masking:** Masking recognizes the formats listed under [Masking personal details](#masking-personal-details). Names, free-form addresses, numbers without context, values split across messages, or encoded values are not recognized.
 
 ---

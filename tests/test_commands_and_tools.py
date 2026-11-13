@@ -192,7 +192,7 @@ def test_slash_cli_rpc_and_rest_api_end_to_end(isolated_hermes_env, capsys):
     assert "burned" in msg_burn.lower()
 
     msg_verify = slash("verify sess-slash-1", session_id="")
-    assert "zero-trace verified" in msg_verify.lower()
+    assert "no tracked local artifacts found" in msg_verify.lower()
 
     # Test RPC methods
     rpc_arm_res = ctx.rpcs["arm"]({"mode": "strict", "ttl_minutes": 15, "redact_pii": True})

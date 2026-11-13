@@ -1,11 +1,11 @@
 ---
 name: incognito-privacy
-description: "Use when managing ephemeral, private, or incognito sessions and verifying zero-trace deletion."
+description: "Use when managing ephemeral, private, or incognito sessions and checking local cleanup."
 ---
 
 # Incognito Privacy
 
-Operational procedures for ephemeral sessions, outbound PII redaction, tool mutation guards, and zero-trace forensic verification.
+Operational procedures for ephemeral sessions, outbound PII redaction, tool mutation guards, and local cleanup checks.
 
 ## Modes
 
@@ -13,7 +13,7 @@ Operational procedures for ephemeral sessions, outbound PII redaction, tool muta
   - Ephemeral session hidden from session history listings and dashboard sidebars.
   - Blocks persistent memory writes (`memory` tool) and skill modifications (`skill_manage` tool).
   - Outbound queries retain existing user profile and notes for contextual assistance.
-  - Automatically deleted upon session close or TTL expiration.
+  - Eligible for cleanup when the session closes or a sweep runs after TTL expiry.
 - `strict` (Clean-Room):
   - All guarantees of `standard`.
   - Blocks cross-session inspection tools (`session_search`, `cronjob_manage`).
@@ -46,7 +46,7 @@ Run forensic verification on a session ID to confirm zero lingering trace on dis
   - Session transcript JSONL files are deleted.
   - Hook output spill directories are wiped.
   - RAM PII vault entries are purged.
-  - Returns cryptographic receipt ID proving zero residue.
+  - Returns a receipt ID for the cleanup attempt and checks the tracked local artifacts.
 
 ### Slash Commands
 - `/incognito` or `/incognito status`: Show status summary and active mode (never changes the mode).
@@ -56,7 +56,7 @@ Run forensic verification on a session ID to confirm zero lingering trace on dis
 - `/incognito arm [standard|strict]`: Arm the next created chat.
 - `/incognito burn`: Immediately overwrite, unlink, and delete current chat.
 - `/incognito sweep`: Purge all expired incognito sessions.
-- `/incognito verify <id>`: Run forensic zero-trace audit.
+- `/incognito verify <id>`: Check tracked local session artifacts.
 
 ### CLI Commands
 - `hermes incognito status`

@@ -29,10 +29,10 @@ export const LEVELS = {
   standard: {
     label: 'Standard',
     title: 'Incognito · Standard',
-    summary: "Hidden from your chat list and deleted when you're done. Hermes won't save memories or change skills.",
+    summary: "Hidden from your chat list. Hermes won't save memories or change skills.",
     protects: [
       'Hidden from the chat list and search',
-      'Deleted when the chat closes or sits idle too long',
+      'Cleanup on close or on a sweep after the idle limit',
       'No memory writes or skill changes'
     ]
   },
@@ -155,7 +155,7 @@ export function toastFor(plan) {
     case 'enable':
       return plan.switched
         ? `Switched to ${levelName(plan.mode)}.`
-        : `Incognito on · ${levelName(plan.mode)}. This chat will be deleted when you're done.`
+        : `Incognito on · ${levelName(plan.mode)}. Incognito protections are active.`
     case 'disable':
       return 'Incognito off. This chat will be kept in your history.'
     case 'arm':
@@ -175,11 +175,11 @@ export function toastFor(plan) {
 export function describeTtl(state) {
   if (!state) return ''
   const ttl = Number(state.ttl_minutes ?? 0)
-  if (!ttl) return 'Deleted when you close it'
-  const base = `Deleted after ${ttl} min idle`
+  if (!ttl) return state.auto_purge_on_exit === false ? 'Manual cleanup' : 'Cleanup on close'
+  const base = `Eligible for cleanup after ${ttl} min idle`
   if (state.remaining_seconds == null) return base
   const left = Math.max(0, Math.ceil(Number(state.remaining_seconds) / 60))
-  return `${base} · ${left} min left`
+  return left === 0 ? 'Idle limit reached · Cleanup on next sweep' : `${base} · ${left} min to eligibility`
 }
 
 // -----------------------------------------------------------------------------
@@ -802,7 +802,7 @@ async function performBurn(ctx, sessionId) {
     'info',
     result.pending_burn
       ? 'Deleting. Hermes will finish cleanup in a moment; the chat stays protected until then.'
-      : 'Chat deleted. Nothing was left on this computer.'
+      : 'Chat cleanup completed.'
   )
 }
 
@@ -1203,7 +1203,7 @@ export async function performUndo(ctx, sessionId) {
     return null
   }
   notifyStateListeners()
-  notify('info', `Back in Incognito · ${levelName(res.mode)}. This chat will be deleted when you're done.`)
+  notify('info', `Back in Incognito · ${levelName(res.mode)}. Incognito protections are active.`)
   return res
 }
 
@@ -1775,7 +1775,7 @@ function AdvancedSection({ ctx, status, focusedSessionId }) {
                   jsx('div', { style: { fontSize: '12px', fontWeight: 600, color: text.primary }, children: 'Check for leftovers' }),
                   jsx('p', {
                     style: { ...caption, margin: '2px 0 8px 0' },
-                    children: 'Confirm a deleted chat left nothing behind in the local database, transcript files, hook outputs, or memory.'
+                    children: 'Check the session rows, known transcript and hook files, and this process’s masking vault.'
                   }),
                   jsxs('div', {
                     style: { display: 'flex', gap: '8px' },
@@ -1803,10 +1803,10 @@ function AdvancedSection({ ctx, status, focusedSessionId }) {
                         children: [
                           jsx('div', {
                             style: { fontFamily: 'inherit', fontWeight: 600, color: clean ? 'var(--ui-green)' : 'var(--ui-yellow)' },
-                            children: clean ? 'Nothing left behind.' : 'Leftovers found.'
+                            children: clean ? 'No artifacts found in these checks.' : verification.db_rows_found == null ? 'Database check unavailable.' : 'Artifacts or an active lease remain.'
                           }),
                           jsx('div', {
-                            children: `Database rows ${verification.db_rows_found ?? 0} · Transcripts ${verification.session_files_found ?? 0} · Hook files ${verification.hook_files_found ?? 0} · Memory ${verification.ram_vault_entries ?? 0}`
+                            children: `Database rows ${verification.db_rows_found ?? 'unavailable'} · Transcripts ${verification.session_files_found ?? 0} · Hook files ${verification.hook_files_found ?? 0} · Memory ${verification.ram_vault_entries ?? 0}`
                           }),
                           verification.receipt_id ? jsx('div', { children: `Receipt ${verification.receipt_id}` }) : null
                         ]
