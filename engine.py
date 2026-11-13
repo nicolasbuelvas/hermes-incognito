@@ -209,6 +209,10 @@ def _live_head_for(leases: dict[str, Any], session_id: str) -> str | None:
     return None
 
 
+class IncognitoActivationError(RuntimeError):
+    """Automatic Incognito activation failed before the first turn."""
+
+
 class IncognitoEngine:
     """Core runtime engine managing zero-trace incognito state and sanitization."""
 
@@ -425,24 +429,19 @@ class IncognitoEngine:
             settings = self.get_settings()
             default_mode = settings.get("default_mode", "off")
 
+            if not armed and default_mode not in ("standard", "strict"):
+                return None
+            res = self.enable_session(
+                session_id=session_id,
+                mode=armed["mode"] if armed else default_mode,
+                ttl_minutes=armed.get("ttl_minutes") if armed else settings.get("default_ttl_minutes"),
+                redact_pii=armed.get("redact_pii") if armed else settings.get("redact_outbound_pii"),
+            )
+            if not res["ok"]:
+                raise IncognitoActivationError(res["error"])
             if armed:
                 self._write_armed(None)
-                res = self.enable_session(
-                    session_id=session_id,
-                    mode=armed.get("mode", "standard"),
-                    ttl_minutes=armed.get("ttl_minutes"),
-                    redact_pii=armed.get("redact_pii"),
-                )
-                return res.get("lease")
-            elif default_mode in ("standard", "strict"):
-                res = self.enable_session(
-                    session_id=session_id,
-                    mode=default_mode,
-                    ttl_minutes=settings.get("default_ttl_minutes"),
-                    redact_pii=settings.get("redact_outbound_pii"),
-                )
-                return res.get("lease")
-            return None
+            return res["lease"]
 
     # -------------------------------------------------------------------------
     # 6. enable_session
@@ -508,19 +507,8 @@ class IncognitoEngine:
                 }
                 newly_protected = True
 
-            # Update SessionDB if available
-            state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
-                try:
-                    db = SessionDB(db_path=state_db)
-                    try:
-                        db.set_session_hidden(session_id, True)
-                        db.patch_session_model_config(session_id, {"incognito": lease})
-                    finally:
-                        if hasattr(db, "close"):
-                            db.close()
-                except Exception:
-                    pass
+            if SessionDB is not None and not self._set_history_state({session_id: lease}):
+                return {"ok": False, "error": "Could not hide the chat in history. Try again."}
 
             leases[session_id] = lease
             self._write_leases(leases)
@@ -781,6 +769,8 @@ class IncognitoEngine:
             if isinstance(lease, dict) and not lease.get("pending_burn") and not _is_ancestor_lease(lease):
                 now = time.time()
                 leases[session_id]["last_activity"] = now
+                if not leases[session_id].get("owner_pid"):
+                    leases[session_id]["owner_pid"] = os.getpid()
                 ttl = leases[session_id].get("ttl_minutes", 0)
                 if ttl > 0:
                     leases[session_id]["expires_at"] = now + (ttl * 60)
@@ -815,6 +805,7 @@ class IncognitoEngine:
                     return {"ok": True, "propagated": False, "saved": True, "session_id": new_session_id}
                 return {"ok": True, "propagated": False, "session_id": new_session_id}
 
+            root_id = _live_head_for(leases, old_session_id) if _is_ancestor_lease(old_lease) else None
             now = time.time()
             ancestor_lineage = sorted(set(list(old_lease.get("lineage_ids") or []) + [old_session_id]))
 
@@ -841,6 +832,10 @@ class IncognitoEngine:
 
             leases[new_session_id] = new_lease
             leases[old_session_id] = old_lease
+            if root_id:
+                new_lease["compacted_into"] = root_id
+                new_lease["expires_at"] = None
+                self._add_subagent_lease(leases, root_id, new_lease)
             self._write_leases(leases)
 
             # Update SessionDB
@@ -2083,6 +2078,8 @@ class IncognitoEngine:
                 lease = dict(snap)
                 lease["session_id"] = sid
                 lease.pop("pending_burn", None)
+                # Undo can run in a short-lived CLI process. The next real turn claims ownership.
+                lease.pop("owner_pid", None)
                 if not _is_ancestor_lease(lease):
                     lease["last_activity"] = now
                     ttl = lease.get("ttl_minutes", 0) or 0

@@ -331,3 +331,70 @@ def test_subagents_started_during_undo_are_masked_and_restored(eng, db, isolated
     for sid in ("root", "helper", "nested"):
         assert db.get_session(sid) is None
         assert eng.verify_zero_trace(sid)["zero_trace"]
+
+
+
+def test_undo_after_restart_survives_sweep_until_new_idle_deadline(db, isolated_hermes_env, clock, monkeypatch):
+    home = isolated_hermes_env["home"]
+    monkeypatch.setattr(plugin_engine, "SessionDB", MockSessionDB)
+    first = plugin_engine.IncognitoEngine(home)
+    with monkeypatch.context() as previous:
+        previous.setattr(plugin_engine.os, "getpid", lambda: 2000000001)
+        _start(first, db, "restart", ttl_minutes=5)
+        assert first.save_session("restart")["ok"]
+    restarted = plugin_engine.IncognitoEngine(home)
+    monkeypatch.setattr(plugin_engine, "_is_pid_alive", lambda _: False)
+    with monkeypatch.context() as cli:
+        cli.setattr(plugin_engine.os, "getpid", lambda: 2000000000)
+        assert restarted.undo_save("restart")["ok"]
+    assert restarted.sweep_expired()["swept_count"] == 0
+    assert db.get_session("restart") is not None
+    restarted.touch_session("restart")
+    assert restarted._read_leases()["restart"]["owner_pid"] == plugin_engine.os.getpid()
+    clock["now"] += 301
+    assert restarted.sweep_expired()["swept_count"] == 1
+    assert db.get_session("restart") is None
+
+
+def test_compacted_active_helper_stays_with_parent_through_save_undo_and_burn(eng, db, isolated_hermes_env):
+    _start(eng, db, "root", redact_pii=True)
+    eng.adopt_subagent("root", "helper")
+    db.create_session("helper")
+    db.create_session("helper-tip")
+    assert eng.propagate_compaction("helper", "helper-tip")["ok"]
+    assert eng.live_head_for("helper-tip") == "root"
+    assert eng.get_session_state("helper-tip")["expires_at"] is None
+    for sid in ("root", "helper", "helper-tip"):
+        _transcript(isolated_hermes_env["home"], sid)
+    assert eng.save_session("root")["ok"]
+    assert not eng.is_incognito("helper-tip")
+    assert eng.masking_active("helper-tip")
+    assert eng.undo_save("root")["ok"]
+    assert eng.is_incognito("helper-tip")
+    assert not eng.burn_session("root")["pending_burn"]
+    for sid in ("root", "helper", "helper-tip"):
+        assert db.get_session(sid) is None
+        assert eng.verify_zero_trace(sid)["zero_trace"]
+
+
+def test_enable_fails_if_existing_chat_cannot_be_hidden_and_armed_turn_can_retry(eng, db, monkeypatch):
+    ctx = SimCtx()
+    plugin.register(ctx)
+    db.create_session("existing")
+    eng.arm_next_session("strict", redact_pii=True)
+    pre_llm_call = ctx.hooks["pre_llm_call"][0]
+    messages = [{"role": "user", "content": EMAIL}]
+
+    with monkeypatch.context() as failure:
+        failure.setattr(MockSessionDB, "set_session_hidden", lambda *args: False)
+        assert not eng.enable_session("existing", "strict")["ok"]
+        assert db.get_session_model_config_value("existing", "incognito") is None
+        assert not eng.is_incognito("existing")
+        ctx.hooks["on_session_start"][0](session_id="existing")
+        assert pre_llm_call("existing", is_first_turn=True, conversation_history=messages)["action"] == "block"
+        assert eng.get_armed_state() is not None
+
+    assert isinstance(pre_llm_call("existing", is_first_turn=True, conversation_history=messages), str)
+    assert _hidden(db, "existing")
+    assert eng.get_armed_state() is None
+    assert messages[0]["content"] == "[EMAIL_1]"

@@ -22,11 +22,11 @@ except ImportError:
         return default
 
 try:
-    from .engine import get_engine
+    from .engine import IncognitoActivationError, get_engine
     from .schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
     from .tools import incognito_control, incognito_verify
 except (ImportError, ValueError):
-    from engine import get_engine
+    from engine import IncognitoActivationError, get_engine
     from schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
     from tools import incognito_control, incognito_verify
 
@@ -98,7 +98,10 @@ def register(ctx: Any) -> None:
         """Initialize session state and sweep expired orphans."""
         sid = _resolve_session_id(kwargs, session_id)
         if sid:
-            engine.consume_armed_session(sid)
+            try:
+                engine.consume_armed_session(sid)
+            except IncognitoActivationError:
+                logger.warning("Could not activate Incognito at session start; the first turn will retry.")
         engine.sweep_expired()
 
     def pre_llm_call(session_id: str = "", is_first_turn: bool = False, **kwargs: Any) -> Any:
@@ -111,11 +114,13 @@ def register(ctx: Any) -> None:
         sid = _resolve_session_id(kwargs, session_id)
         if not sid:
             return None
-        if is_first_turn:
-            engine.consume_armed_session(sid)
         try:
+            if is_first_turn:
+                engine.consume_armed_session(sid)
             if engine.masking_active(sid):
                 engine.mask_messages_in_place(sid, kwargs.get("conversation_history"))
+        except IncognitoActivationError as exc:
+            return {"action": "block", "message": f"Could not activate Incognito. {exc}"}
         except Exception as exc:
             logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
             return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}

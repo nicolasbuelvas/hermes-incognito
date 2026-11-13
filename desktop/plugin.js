@@ -602,17 +602,19 @@ export const MASK_BLOCKED = {
 
 /** Whether a chat (or the next new chat) masks before sending, from a status response. */
 export function maskingFor(status, sessionId) {
-  if (!status) return null
+  if (!status || status.ok === false || status.status === 'unavailable') return null
   if (sessionId) {
     const state = status.session_state || status.current_session
     if (state?.active) return { on: Boolean(state.redact_pii), counts: state.masked_counts || {} }
     if (status.saved?.redact_pii) return { on: true, counts: {} }
     return { on: false, counts: {} }
   }
-  return { on: Boolean(status.armed?.redact_pii), counts: {} }
+  const mode = status.armed?.mode ?? status.settings?.default_mode
+  const enabled = status.armed
+    ? status.armed.redact_pii
+    : (mode === 'standard' || mode === 'strict') && status.settings?.redact_outbound_pii
+  return { on: Boolean(enabled), counts: {} }
 }
-
-let lastKnownMasking = new Map()
 
 /**
  * Composer middleware: runs on every send, before the text reaches Hermes. It reads the chat's
@@ -623,9 +625,8 @@ let lastKnownMasking = new Map()
  */
 export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.focusedSessionId?.get?.() || '', fetch = fetchStatus } = {}) {
   return async function maskBeforeSend(draft) {
-    const sessionId = getSessionId()
-    const key = sessionId || '__next__'
     try {
+      const sessionId = getSessionId()
       let masking = null
       try {
         masking = maskingFor(await fetch(ctx, sessionId), sessionId)
@@ -633,13 +634,9 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
         masking = null
       }
       if (!masking) {
-        if (lastKnownMasking.get(key)) {
-          notify('warning', MASK_BLOCKED.offline)
-          return null
-        }
-        return draft
+        notify('warning', MASK_BLOCKED.offline)
+        return null
       }
-      lastKnownMasking.set(key, masking.on)
       if (!masking.on) return draft
       if (Array.isArray(draft?.attachments) && draft.attachments.length) {
         notify('warning', MASK_BLOCKED.attachments)
@@ -667,7 +664,6 @@ export function _resetMaskingForTests() {
   vaults.clear()
   sendListeners.clear()
   lastSend = null
-  lastKnownMasking = new Map()
 }
 
 // -----------------------------------------------------------------------------
@@ -1870,7 +1866,7 @@ function PrivacyControlCenter({ ctx }) {
 export default {
   id: 'incognito',
   name: 'Incognito Sessions',
-  description: 'Private chats that leave no trace: hidden, auto-deleted, with optional profile and PII protection.',
+  description: 'Hidden chats with local cleanup and optional profile and personal detail protection.',
   register(ctx) {
     const refreshAll = () => notifyStateListeners()
     const unbind1 = ctx.onEvent?.('plugin.incognito.state.changed', refreshAll)

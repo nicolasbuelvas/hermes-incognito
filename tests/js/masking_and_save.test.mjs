@@ -190,11 +190,27 @@ test('fail closed: if masking was on and the status check fails, nothing is sent
   assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline)
 })
 
-test('a status error with no masking history passes through (the backend gate still checks)', async () => {
+test('a status error cancels the first send too', async () => {
   setFocused('s9')
-  const handler = makeMaskingMiddleware(fakeCtx(null), { fetch: async () => null })
-  const draft = { text: 'hello' }
-  assert.equal(await handler(draft), draft)
+  for (const unavailable of [null, { ok: false }, { status: 'unavailable' }]) {
+    const handler = makeMaskingMiddleware(fakeCtx(unavailable), { fetch: async () => unavailable })
+    assert.equal(await handler({ text: SECRET_TEXT }), null)
+    assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline)
+  }
+})
+
+test('the first draft uses the default mode and masking settings unless explicitly armed', async () => {
+  setFocused('')
+  const settings = { default_mode: 'strict', redact_outbound_pii: true }
+  const draft = { text: SECRET_TEXT }
+  const handler = makeMaskingMiddleware(fakeCtx({ settings }))
+  const masked = await handler(draft)
+  for (const raw of RAW) assert.ok(!masked.text.includes(raw))
+
+  const override = makeMaskingMiddleware(fakeCtx({ settings, armed: { mode: 'standard', redact_pii: false } }))
+  assert.equal(await override(draft), draft)
+  const normal = makeMaskingMiddleware(fakeCtx({ settings: { ...settings, default_mode: 'off' } }))
+  assert.equal(await normal(draft), draft)
 })
 
 test('burning a chat forgets its local values', () => {
