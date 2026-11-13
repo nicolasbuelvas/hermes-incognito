@@ -190,11 +190,27 @@ test('fail closed: if masking was on and the status check fails, nothing is sent
   assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline)
 })
 
-test('a status error with no masking history passes through (the backend gate still checks)', async () => {
+test('a status error cancels the first send too', async () => {
   setFocused('s9')
-  const handler = makeMaskingMiddleware(fakeCtx(null), { fetch: async () => null })
-  const draft = { text: 'hello' }
-  assert.equal(await handler(draft), draft)
+  for (const unavailable of [null, { ok: false }, { status: 'unavailable' }]) {
+    const handler = makeMaskingMiddleware(fakeCtx(unavailable), { fetch: async () => unavailable })
+    assert.equal(await handler({ text: SECRET_TEXT }), null)
+    assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline)
+  }
+})
+
+test('the first draft uses the default mode and masking settings unless explicitly armed', async () => {
+  setFocused('')
+  const settings = { default_mode: 'strict', redact_outbound_pii: true }
+  const draft = { text: SECRET_TEXT }
+  const handler = makeMaskingMiddleware(fakeCtx({ settings }))
+  const masked = await handler(draft)
+  for (const raw of RAW) assert.ok(!masked.text.includes(raw))
+
+  const override = makeMaskingMiddleware(fakeCtx({ settings, armed: { mode: 'standard', redact_pii: false } }))
+  assert.equal(await override(draft), draft)
+  const normal = makeMaskingMiddleware(fakeCtx({ settings: { ...settings, default_mode: 'off' } }))
+  assert.equal(await normal(draft), draft)
 })
 
 test('burning a chat forgets its local values', () => {
@@ -288,4 +304,49 @@ test('palette offers save and undo', () => {
   plugin.register(ctx)
   assert.ok(ctx.registered.find(c => c.id === 'palette-save'))
   assert.ok(ctx.registered.find(c => c.id === 'palette-undo-save'))
+})
+
+test('a first draft does not leave originals in an unassigned chat or reuse its placeholders', async () => {
+  const first = makeMaskingMiddleware(fakeCtx({ armed: { mode: 'strict', redact_pii: true } }))
+  assert.equal((await first({ text: 'first@example.org' })).text, '[EMAIL_1]')
+  assert.equal(getLastSend(), null)
+  assert.equal(vaultFor('').size, 0)
+
+  setFocused('new-chat')
+  const followup = makeMaskingMiddleware(fakeCtx(status()))
+  assert.equal((await followup({ text: 'next@example.org' })).text, '[EMAIL_2]')
+  assert.equal(vaultFor('new-chat').get('[EMAIL_2]'), 'next@example.org')
+})
+
+test('a completed burn event clears only the deleted chat from Desktop memory', async () => {
+  const ctx = fakeCtx(status())
+  const callbacks = new Map()
+  ctx.onEvent = (name, callback) => callbacks.set(name, callback)
+  plugin.register(ctx)
+
+  maskText('other@example.org', vaultFor('other'))
+  setFocused('delete-me')
+  const send = makeMaskingMiddleware(ctx)
+  await send({ text: 'delete@example.org' })
+  const vault = vaultFor('delete-me')
+  const onStateChanged = callbacks.get('plugin.incognito.state.changed')
+  onStateChanged({ payload: { session_id: 'delete-me', burned: false, active: true } })
+  assert.equal(vault.size, 1)
+
+  onStateChanged({ payload: { session_id: 'delete-me', burned: true, active: false } })
+  assert.equal(vault.size, 0)
+  assert.equal(getLastSend(), null)
+  assert.equal(vaultFor('other').size, 1)
+})
+
+test('a saved chat reserves backend marker numbers and drops its vault when a burn is observed', async () => {
+  setFocused('saved-chat')
+  let current = status({ active: false, saved: { redact_pii: true, masked_counts: { EMAIL: 1 } } })
+  const send = makeMaskingMiddleware(fakeCtx(() => current))
+  assert.equal((await send({ text: 'new@example.org' })).text, '[EMAIL_2]')
+  const vault = vaultFor('saved-chat')
+  assert.equal(vault.size, 1)
+  current = { ok: true, burned: true }
+  assert.equal(await send({ text: 'hello' }), null)
+  assert.equal(vault.size, 0)
 })

@@ -151,7 +151,7 @@ The Desktop UI uses the Hermes UI kit (`Badge`, `SegmentedControl`, `ToggleRow`,
 - **Incognito page (`ROUTES_AREA` and `SIDEBAR_NAV_AREA`):** A level picker (Normal, Standard, Strict) for the focused chat, with what each level protects, a **Mask personal details** switch, a **Next new chat** picker, a **When to use each level** guide, and a collapsed **Advanced** section with content-free totals and the local cleanup check.
 - **Delete confirmation:** Every delete entry point asks first: "Delete this chat permanently?".
 - **Save confirmation:** Every way of leaving Incognito while keeping the chat (banner, status bar, shortcut, level picker, palette) asks "Save this chat to your history?" and then shows an **Undo** toast.
-- **Masking feedback (`COMPOSER_AREAS.middleware` and `underside`):** With masking on, Desktop masks the message in the composer before Hermes receives it. While you type, a strip lists what will be masked. After sending, a card animates each value into its placeholder (Hermes' decode effect; static under reduced motion), shows "3 details masked before sending", and expands to **Sent to model** with the exact text the model received. **Show values** reveals the originals from this window's memory only.
+- **Masking feedback (`COMPOSER_AREAS.middleware` and `underside`):** With masking on, Desktop masks the message in the composer before Hermes receives it. While you type, a strip lists what will be masked. After sending, a card animates each value into its placeholder (Hermes' decode effect; static under reduced motion), shows "3 details masked before sending", and expands to **Sent to model** with the masked text handed to Hermes. **Show values** reveals the originals from this window's memory only.
 
 ---
 
@@ -214,7 +214,7 @@ Where it applies, in order:
 5. **`llm_execution` gate:** the final payload of every attempt (retries included) is masked again and re-checked. If anything still looks like a personal detail, or masking fails, the call is stopped before the network: "Incognito didn't send this message because it couldn't confirm your personal details were masked."
 6. **Helper agents** started from the chat inherit Incognito, masking, and the same placeholders.
 
-Model replies keep the placeholders. The real values are never put back into anything Hermes sends or saves. The placeholder map lives in memory only, is shared across compaction, and is wiped on burn. Desktop keeps its own copy in the window's memory so **Show values** works locally.
+Model replies keep the placeholders. The real values are never put back into anything Hermes sends or saves. The placeholder map lives in memory only, is shared across compaction, and is wiped on burn. Desktop keeps originals for identified chats in the window's memory so **Show values** works locally. Hermes Desktop may persist unsent drafts in its own storage before the send middleware runs. Incognito does not control that storage.
 
 Known limits: masking is pattern-based (see the security disclosure below). On CLI and TUI, Hermes passes the raw user message to external memory providers and `pre_api_request` observers before any plugin can change it; use Desktop, or turn off external memory providers, if that matters. Hermes' `safe_worker` mode loads no plugins.
 

@@ -199,8 +199,9 @@ def test_slash_cli_rpc_and_rest_api_end_to_end(isolated_hermes_env, capsys):
     assert rpc_arm_res["ok"] is True
     assert rpc_arm_res["armed"]["mode"] == "strict"
 
-    # Simulate session start hook consuming the armed state
     ctx.hooks["on_session_start"](session_id="sess-armed-1")
+    assert ctx.rpcs["status"]({"session_id": "sess-armed-1"})["armed"]
+    ctx.hooks["pre_llm_call"](session_id="sess-armed-1", is_first_turn=True)
     rpc_status_res = ctx.rpcs["status"]({"session_id": "sess-armed-1"})
     assert rpc_status_res["incognito"] is True
     assert rpc_status_res["mode"] == "strict"

@@ -76,7 +76,7 @@ const COPY = {
   offline: 'The Incognito backend is not running. Enable it with: hermes plugins enable incognito',
   hintTitle: 'Incognito is available',
   hintBody:
-    "Chat without leaving a trace. Standard hides the chat and deletes it when you're done. Strict also keeps your profile and notes away from the model.",
+    "Standard hides the chat and supports local cleanup. Strict also keeps your profile and notes away from the model.",
   hintTry: 'Try Standard',
   hintCompare: 'Compare levels',
   hintDismiss: 'Dismiss',
@@ -557,6 +557,9 @@ export function prefersReducedMotion() {
 // Per-chat vaults and the last masked send, kept in this window's memory only.
 const vaults = new Map()
 const sendListeners = new Set()
+// The first draft has no session ID. Keep only its counter high-water mark
+// so later sends cannot reuse its placeholders for different values.
+const firstDraftCounts = {}
 let lastSend = null
 
 export function vaultFor(sessionId, counts) {
@@ -602,17 +605,19 @@ export const MASK_BLOCKED = {
 
 /** Whether a chat (or the next new chat) masks before sending, from a status response. */
 export function maskingFor(status, sessionId) {
-  if (!status) return null
+  if (!status || status.ok === false || status.status === 'unavailable') return null
   if (sessionId) {
     const state = status.session_state || status.current_session
     if (state?.active) return { on: Boolean(state.redact_pii), counts: state.masked_counts || {} }
-    if (status.saved?.redact_pii) return { on: true, counts: {} }
+    if (status.saved?.redact_pii) return { on: true, counts: status.saved.masked_counts || {} }
     return { on: false, counts: {} }
   }
-  return { on: Boolean(status.armed?.redact_pii), counts: {} }
+  const mode = status.armed?.mode ?? status.settings?.default_mode
+  const enabled = status.armed
+    ? status.armed.redact_pii
+    : (mode === 'standard' || mode === 'strict') && status.settings?.redact_outbound_pii
+  return { on: Boolean(enabled), counts: {} }
 }
-
-let lastKnownMasking = new Map()
 
 /**
  * Composer middleware: runs on every send, before the text reaches Hermes. It reads the chat's
@@ -623,31 +628,38 @@ let lastKnownMasking = new Map()
  */
 export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.focusedSessionId?.get?.() || '', fetch = fetchStatus } = {}) {
   return async function maskBeforeSend(draft) {
-    const sessionId = getSessionId()
-    const key = sessionId || '__next__'
     try {
+      const sessionId = getSessionId()
       let masking = null
       try {
-        masking = maskingFor(await fetch(ctx, sessionId), sessionId)
+        const status = await fetch(ctx, sessionId)
+        if (sessionId && status?.burned) {
+          forgetChat(sessionId)
+          return null
+        }
+        masking = maskingFor(status, sessionId)
       } catch {
         masking = null
       }
       if (!masking) {
-        if (lastKnownMasking.get(key)) {
-          notify('warning', MASK_BLOCKED.offline)
-          return null
-        }
-        return draft
+        notify('warning', MASK_BLOCKED.offline)
+        return null
       }
-      lastKnownMasking.set(key, masking.on)
       if (!masking.on) return draft
       if (Array.isArray(draft?.attachments) && draft.attachments.length) {
         notify('warning', MASK_BLOCKED.attachments)
         return null
       }
-      const vault = vaultFor(sessionId, masking.counts)
+      const vault = sessionId ? vaultFor(sessionId, masking.counts) : new Vault()
+      vault.seed(firstDraftCounts)
       const result = maskText(String(draft?.text ?? ''), vault)
       if (findPii(result.text).length) throw new Error('residual')
+      if (!sessionId) {
+        Object.assign(firstDraftCounts, vault.counters)
+        // The host has not assigned this draft to a chat yet.
+        setLastSend(null)
+        return { ...draft, text: result.text }
+      }
       setLastSend({
         sessionId,
         at: Date.now(),
@@ -664,10 +676,11 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
 }
 
 export function _resetMaskingForTests() {
+  for (const vault of vaults.values()) vault.clear()
   vaults.clear()
+  for (const kind of Object.keys(firstDraftCounts)) delete firstDraftCounts[kind]
   sendListeners.clear()
   lastSend = null
-  lastKnownMasking = new Map()
 }
 
 // -----------------------------------------------------------------------------
@@ -961,6 +974,7 @@ function useIncognitoStatus(ctx, sessionId, { poll = false } = {}) {
   const refresh = useCallback(async () => {
     const res = await fetchStatus(ctx, sessionId)
     if (res) {
+      if (sessionId && res.burned) forgetChat(sessionId)
       setStatus(res)
       setOffline(false)
     } else {
@@ -1420,7 +1434,7 @@ function SentToModelCard({ record, onDismiss }) {
         ? jsxs('div', {
             style: { marginTop: '8px', paddingTop: '8px', borderTop: '1px solid var(--ui-stroke-tertiary)' },
             children: [
-              jsx('div', { style: { ...caption, marginBottom: '4px' }, children: 'Exactly what the model received:' }),
+              jsx('div', { style: { ...caption, marginBottom: '4px' }, children: 'Text passed to Hermes after masking:' }),
               jsx('pre', {
                 'data-incognito': 'sent-text',
                 style: { ...mono, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: text.primary },
@@ -1478,17 +1492,26 @@ function DraftMaskPreview({ sessionId, counts }) {
   const [preview, setPreview] = useState(null)
   useEffect(() => {
     if (typeof window === 'undefined' || typeof host?.composer?.getDraft !== 'function') return undefined
-    const tick = () => {
+    let live = true
+    let reading = false
+    const tick = async () => {
+      if (reading) return
+      reading = true
       try {
-        const draft = host.composer.getDraft(sessionId || null)
-        setPreview(draft && draft.text ? previewDraft(draft.text, counts) : null)
+        const draft = await host.composer.getDraft(sessionId || null)
+        if (live) setPreview(draft ? previewDraft(draft, counts) : null)
       } catch {
-        setPreview(null)
+        if (live) setPreview(null)
+      } finally {
+        reading = false
       }
     }
     tick()
     const id = window.setInterval(tick, 700)
-    return () => window.clearInterval(id)
+    return () => {
+      live = false
+      window.clearInterval(id)
+    }
   }, [sessionId, counts])
   if (!preview || !preview.kinds.length) return null
   return jsxs('div', {
@@ -1870,15 +1893,37 @@ function PrivacyControlCenter({ ctx }) {
 export default {
   id: 'incognito',
   name: 'Incognito Sessions',
-  description: 'Private chats that leave no trace: hidden, auto-deleted, with optional profile and PII protection.',
+  description: 'Hidden chats with local cleanup and optional profile and personal detail protection.',
   register(ctx) {
     const refreshAll = () => notifyStateListeners()
-    const unbind1 = ctx.onEvent?.('plugin.incognito.state.changed', refreshAll)
+    const unbind1 = ctx.onEvent?.('plugin.incognito.state.changed', event => {
+      const payload = event?.payload
+      if (payload?.burned === true && typeof payload.session_id === 'string' && payload.session_id) {
+        forgetChat(payload.session_id)
+      }
+      refreshAll()
+    })
     const unbind2 = ctx.onEvent?.('plugin.incognito.settings.changed', refreshAll)
+    let checkingVaults = false
+    const stopVaultCheck = ctx.setInterval?.(async () => {
+      if (checkingVaults || !vaults.size) return
+      checkingVaults = true
+      try {
+        for (const [sid, vault] of vaults) {
+          const status = await fetchStatus(ctx, sid)
+          if (vaults.get(sid) === vault && (status?.burned || maskingFor(status, sid)?.on === false)) {
+            forgetChat(sid)
+          }
+        }
+      } finally {
+        checkingVaults = false
+      }
+    }, 30000)
 
     ctx.onDispose(() => {
       if (typeof unbind1 === 'function') unbind1()
       if (typeof unbind2 === 'function') unbind2()
+      if (typeof stopVaultCheck === 'function') stopVaultCheck()
       stateListeners.clear()
       burnHosts.clear()
       saveHosts.clear()

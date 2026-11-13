@@ -22,11 +22,11 @@ except ImportError:
         return default
 
 try:
-    from .engine import get_engine
+    from .engine import IncognitoActivationError, get_engine
     from .schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
     from .tools import incognito_control, incognito_verify
 except (ImportError, ValueError):
-    from engine import get_engine
+    from engine import IncognitoActivationError, get_engine
     from schemas import INCOGNITO_CONTROL_SCHEMA, INCOGNITO_VERIFY_SCHEMA
     from tools import incognito_control, incognito_verify
 
@@ -72,6 +72,14 @@ def _resolve_session_id(kwargs: dict[str, Any], explicit: str = "") -> str:
 def register(ctx: Any) -> None:
     """Entry point called by Hermes plugin loader to register capabilities."""
     engine = get_engine()
+    emit_to_session = getattr(ctx, "emit_to_session", None)
+    if callable(emit_to_session):
+        def notify_burned(session_id: str) -> None:
+            emit_to_session(session_id, "state.changed", {
+                "session_id": session_id, "active": False, "burned": True
+            })
+
+        engine.on_burn_complete = notify_burned
 
     # -------------------------------------------------------------------------
     # 1. Register Tools
@@ -95,10 +103,7 @@ def register(ctx: Any) -> None:
     # 2. Register Hooks
     # -------------------------------------------------------------------------
     def on_session_start(session_id: str = "", **kwargs: Any) -> None:
-        """Initialize session state and sweep expired orphans."""
-        sid = _resolve_session_id(kwargs, session_id)
-        if sid:
-            engine.consume_armed_session(sid)
+        """Sweep expired sessions when Hermes initializes a conversation."""
         engine.sweep_expired()
 
     def pre_llm_call(session_id: str = "", is_first_turn: bool = False, **kwargs: Any) -> Any:
@@ -111,11 +116,13 @@ def register(ctx: Any) -> None:
         sid = _resolve_session_id(kwargs, session_id)
         if not sid:
             return None
-        if is_first_turn:
-            engine.consume_armed_session(sid)
         try:
+            if is_first_turn:
+                engine.consume_armed_session(sid)
             if engine.masking_active(sid):
                 engine.mask_messages_in_place(sid, kwargs.get("conversation_history"))
+        except IncognitoActivationError as exc:
+            return {"action": "block", "message": f"Could not activate Incognito. {exc}"}
         except Exception as exc:
             logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
             return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}
@@ -186,11 +193,9 @@ def register(ctx: Any) -> None:
                 return
             reason = str(kwargs.get("hook_name") or "session_finalize")
             result = engine.burn_session(sid, reason=reason)
-            if result.get("ok") and hasattr(ctx, "emit_to_session"):
+            if result.get("ok") and result["pending_burn"] and callable(emit_to_session):
                 try:
-                    ctx.emit_to_session(sid, "state.changed", {
-                        "active": result["pending_burn"], "burned": not result["pending_burn"]
-                    })
+                    emit_to_session(sid, "state.changed", {"session_id": sid, "active": True, "burned": False})
                 except Exception:
                     pass
 
@@ -698,7 +703,9 @@ def register(ctx: Any) -> None:
             if mode == "off" or engine.get_armed_state():
                 engine.disarm_next_session()
             else:
-                engine.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
+                result = engine.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
+                if not result["ok"]:
+                    return result
             return engine.status_summary("")
 
         def rpc_enable(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
@@ -712,8 +719,7 @@ def register(ctx: Any) -> None:
             ttl = p.get("ttl_minutes")
             redact = p.get("redact_pii")
             result = engine.enable_session(
-                sid, mode=mode, ttl_minutes=int(ttl) if ttl is not None else None,
-                redact_pii=None if redact is None else bool(redact),
+                sid, mode=mode, ttl_minutes=ttl, redact_pii=redact,
             )
             return {**engine.status_summary(sid), "ok": True} if result.get("ok") else result
 
@@ -736,6 +742,8 @@ def register(ctx: Any) -> None:
 
         def rpc_arm(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
             p = params or {}
+            if "disarm" in p and type(p["disarm"]) is not bool:
+                return {"ok": False, "error": "disarm must be a boolean."}
             if p.get("disarm"):
                 return engine.disarm_next_session()
             mode = p.get("mode", "standard")

@@ -29,6 +29,10 @@ router = APIRouter()
 
 def _resolve_engine() -> Any:
     """Resolve IncognitoEngine singleton with relative and sys.path fallbacks."""
+    engine_path = Path(__file__).resolve().parent.parent / "engine.py"
+    shared = sys.modules.get(f"hermes_incognito_engine:{engine_path}")
+    if shared is not None:
+        return shared.get_engine()
     try:
         from ..engine import get_engine
         return get_engine()
@@ -76,6 +80,8 @@ def get_status(session_id: str = Query("", description="Optional session id to i
 
 @router.post("/toggle")
 def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    if error := _validate_options(body):
+        return {"ok": False, "error": error}
     eng = _resolve_engine()
     if eng is None:
         return {"ok": False, "error": "engine unavailable"}
@@ -84,6 +90,8 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     mode = str(body.get("mode") or "standard")
     ttl = body.get("ttl_minutes")
     redact = body.get("redact_pii")
+    if mode not in ("off", "standard", "strict"):
+        return {"ok": False, "error": "Invalid Incognito mode."}
 
     if session_id and session_id != "new":
         if hasattr(eng, "toggle_session"):
@@ -99,7 +107,7 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
             eng.enable_session(session_id, mode=mode, ttl_minutes=ttl, redact_pii=redact)
     else:
         armed = eng.get_armed_state() if hasattr(eng, "get_armed_state") else None
-        if armed and hasattr(eng, "disarm_next_session"):
+        if (armed or mode == "off") and hasattr(eng, "disarm_next_session"):
             eng.disarm_next_session()
         elif hasattr(eng, "arm_next_session"):
             eng.arm_next_session(mode=mode, ttl_minutes=ttl, redact_pii=redact)
@@ -109,13 +117,21 @@ def toggle_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     return {"ok": True, "session_id": session_id}
 
 
-def _bool_or_none(value: Any) -> Optional[bool]:
-    return None if value is None else bool(value)
+def _validate_options(body: Dict[str, Any]) -> str | None:
+    ttl = body.get("ttl_minutes")
+    if ttl is not None and (type(ttl) is not int or ttl < 0):
+        return "ttl_minutes must be a non-negative integer."
+    for key in ("redact_pii", "disarm"):
+        if key in body and body[key] is not None and type(body[key]) is not bool:
+            return f"{key} must be a boolean."
+    return None
 
 
 @router.post("/enable")
 def enable_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     """Turn Incognito on for a session, or switch its level in place. Never turns it off."""
+    if error := _validate_options(body):
+        return {"ok": False, "error": error}
     eng = _resolve_engine()
     if eng is None:
         return {"ok": False, "error": "engine unavailable"}
@@ -130,8 +146,8 @@ def enable_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     result = eng.enable_session(
         session_id,
         mode=mode,
-        ttl_minutes=int(ttl) if ttl is not None else None,
-        redact_pii=_bool_or_none(body.get("redact_pii")),
+        ttl_minutes=ttl,
+        redact_pii=body.get("redact_pii"),
     )
     if not result.get("ok"):
         return result
@@ -192,6 +208,8 @@ def undo_save(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
 
 @router.post("/arm")
 def arm_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    if error := _validate_options(body):
+        return {"ok": False, "error": error}
     eng = _resolve_engine()
     if eng is None:
         return {"ok": False, "error": "engine unavailable"}
@@ -202,6 +220,8 @@ def arm_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
             eng.disarm_next_session()
     else:
         mode = str(body.get("mode") or "standard")
+        if mode not in ("standard", "strict"):
+            return {"ok": False, "error": "Invalid Incognito mode."}
         ttl = body.get("ttl_minutes")
         redact = body.get("redact_pii")
         if hasattr(eng, "arm_next_session"):
