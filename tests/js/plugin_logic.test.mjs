@@ -89,9 +89,9 @@ test('Toasts state the final state', () => {
 })
 
 test('TTL line shows the idle deadline and time left', () => {
-  assert.equal(describeTtl({ ttl_minutes: 60, remaining_seconds: 2520 }), 'Deleted after 60 min idle · 42 min left')
-  assert.equal(describeTtl({ ttl_minutes: 30 }), 'Deleted after 30 min idle')
-  assert.equal(describeTtl({ ttl_minutes: 0 }), 'Deleted when you close it')
+  assert.equal(describeTtl({ ttl_minutes: 60, remaining_seconds: 2520 }), 'Eligible for cleanup after 60 min idle · 42 min to eligibility')
+  assert.equal(describeTtl({ ttl_minutes: 30 }), 'Eligible for cleanup after 30 min idle')
+  assert.equal(describeTtl({ ttl_minutes: 0 }), 'Cleanup on close')
 })
 
 test('runPlan calls the explicit endpoints and never hits /toggle', async () => {

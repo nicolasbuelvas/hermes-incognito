@@ -10,7 +10,6 @@ from conftest import MockSessionDB
 from hermes_sim import (
     SimCtx,
     SimHermes,
-    install_fake_hermes_middleware,
     load_plugin,
     scan_files,
 )
@@ -214,8 +213,7 @@ def test_memory_and_skills_stay_blocked_while_undo_is_available(eng, db, clock):
     assert eng.evaluate_tool_guard("g1", "memory", {"action": "add", "content": "x"}) is None
 
 
-def test_masking_continues_after_save_until_undo_window_ends(isolated_hermes_env, db, monkeypatch, clock):
-    install_fake_hermes_middleware(monkeypatch)
+def test_masking_continues_after_save_until_undo_window_ends(isolated_hermes_env, db, clock):
     sim = SimHermes(plugin, isolated_hermes_env["home"])
     eng = plugin_engine.get_engine()
     _start(eng, db, "m1", redact_pii=True)
@@ -280,3 +278,56 @@ def test_cli_save_asks_first(eng, db, monkeypatch, capsys):
     capsys.readouterr()
     assert captured["handler"](parser.parse_args(["save", "cli1", "--yes", "--json"])) == 0
     assert json.loads(capsys.readouterr().out)["saved"]["session_id"] == "cli1"
+
+
+@pytest.mark.parametrize("operation", ["save", "undo"])
+def test_history_write_failure_can_be_retried(eng, db, monkeypatch, operation):
+    _start(eng, db, "head", redact_pii=True)
+    eng.mask_text("head", EMAIL)
+    db.create_session("tip")
+    assert eng.propagate_compaction("head", "tip")["ok"]
+    if operation == "undo":
+        assert eng.save_session("tip")["ok"]
+    action = eng.save_session if operation == "save" else eng.undo_save
+    hidden_before = operation == "save"
+    original = MockSessionDB.set_session_hidden
+
+    def fail_once(instance, sid, hidden):
+        if sid == "head" and hidden != hidden_before:
+            raise OSError("simulated SQLite write failure")
+        return original(instance, sid, hidden)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(MockSessionDB, "set_session_hidden", fail_once)
+        assert not action("tip")["ok"]
+        assert eng.is_incognito("tip") is hidden_before
+        assert (_hidden(db, "tip"), _hidden(db, "head")) == (hidden_before, hidden_before)
+        assert (db.get_session_model_config_value("tip", "incognito") is not None) is hidden_before
+        assert (eng.saved_state("tip") is not None) is (not hidden_before)
+        assert eng.masking_active("tip")
+        assert eng.get_vault_entry("tip", "[EMAIL_1]") == EMAIL
+
+    assert action("tip")["ok"]
+    assert _hidden(db, "tip") is (not hidden_before)
+
+
+def test_subagents_started_during_undo_are_masked_and_restored(eng, db, isolated_hermes_env):
+    _start(eng, db, "root", redact_pii=True)
+    assert eng.save_session("root")["ok"]
+    home = isolated_hermes_env["home"]
+    for parent, child in [("root", "helper"), ("helper", "nested")]:
+        db.create_session(child)
+        eng.adopt_subagent(parent, child)
+        _transcript(home, child)
+        assert eng.masking_active(child)
+        assert eng.mask_text(child, EMAIL)[0] == "[EMAIL_1]"
+        assert eng.evaluate_tool_guard(child, "memory", {"action": "add"})["action"] == "block"
+        assert not eng.undo_save(child)["ok"]
+
+    assert eng.undo_save("root")["ok"]
+    assert _hidden(db, "helper") and _hidden(db, "nested")
+    assert eng.is_incognito("helper") and eng.is_incognito("nested")
+    assert not eng.burn_session("root")["pending_burn"]
+    for sid in ("root", "helper", "nested"):
+        assert db.get_session(sid) is None
+        assert eng.verify_zero_trace(sid)["zero_trace"]

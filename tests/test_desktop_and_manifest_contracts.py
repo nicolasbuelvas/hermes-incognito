@@ -94,6 +94,11 @@ def test_plugin_init_registration():
     ctx = MockContext()
     mod.register(ctx)
 
+    manifest = yaml.safe_load((PROJECT_ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    assert set(manifest["provides_tools"]) == ctx.tools.keys()
+    assert set(manifest["provides_hooks"]) == ctx.hooks.keys()
+    assert set(manifest["provides_middleware"]) == ctx.middleware.keys()
+
     # Check tools registered
     assert "incognito_control" in ctx.tools
     assert "incognito_verify" in ctx.tools

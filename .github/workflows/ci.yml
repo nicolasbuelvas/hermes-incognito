@@ -17,7 +17,48 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test runner
-        run: python -m pip install --upgrade pip pytest pyyaml hypothesis
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install plugin and test dependencies
+        run: python -m pip install '.[dev]'
       - name: Run unit and contract suite
         run: pytest -q
+
+
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          # Pin the upstream validator so its contract changes are reviewed explicitly.
+          ref: c9b20d7bc08dec1e10779a06d7d9073bc6e7e418
+          path: .hermes-validator
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install validator dependencies
+        run: python -m pip install ruamel.yaml python-dotenv httpx packaging
+      - name: Run Hermes catalog validator
+        working-directory: .hermes-validator
+        run: |
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from hermes_cli.plugin_validate import validate_plugin_dir
+
+          with TemporaryDirectory() as directory:
+              archive = subprocess.check_output(["git", "-C", "..", "archive", "HEAD"])
+              subprocess.run(["tar", "-xf", "-", "-C", directory], input=archive, check=True)
+              report = validate_plugin_dir(Path(directory))
+          for name, passed, detail in report.checks:
+              print(f"{'PASS' if passed else 'FAIL'} {name}: {detail}")
+          for warning in report.warnings:
+              print(f"WARNING: {warning}")
+          raise SystemExit(report.exit_code or bool(report.warnings))
+          PY

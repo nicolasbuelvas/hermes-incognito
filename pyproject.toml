@@ -1,14 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-incognito"
 version = "1.0.0"
-description = "Zero-trace ephemeral and incognito sessions plugin for Hermes Agent"
+description = "Ephemeral and incognito sessions plugin for Hermes Agent"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest", "pyyaml", "hypothesis"]
+
+[tool.setuptools]
+packages = ["hermes_incognito", "hermes_incognito.dashboard"]
+package-dir = { hermes_incognito = "." }
+
+[tool.setuptools.package-data]
+hermes_incognito = ["plugin.yaml", "desktop/plugin.js", "skills/incognito-privacy/SKILL.md"]
+"hermes_incognito.dashboard" = ["manifest.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

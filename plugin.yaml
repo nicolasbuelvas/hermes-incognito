@@ -7,11 +7,11 @@ author: Nicolas Buelvas
 license: MIT
 homepage: https://github.com/nicolasbuelvas/hermes-incognito
 description: >-
-  Zero-trace ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and
+  Ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and
   Desktop: hides active chats from sidebars and listings, blocks persistent
   memory and skill mutations, strips profile memory in strict mode, optionally
   redacts outbound PII in RAM, and scrubs SQLite compression chains and
-  transcript artifacts on close or TTL expiry.
+  transcript artifacts on close or on a sweep after TTL expiry.
 tags:
   - privacy
   - incognito
@@ -26,6 +26,7 @@ provides_hooks:
   - on_session_start
   - pre_llm_call
   - pre_tool_call
+  - subagent_start
   - post_compaction
   - on_session_end
   - on_session_finalize
@@ -53,7 +54,7 @@ config_schema:
     type: int
     default: 60
     label: Idle TTL (minutes)
-    description: Maximum idle lifetime in minutes before orphan sweeps purge an inactive incognito session (0 disables TTL).
+    description: Idle minutes before an incognito session becomes eligible for cleanup on the next sweep (0 disables TTL).
   redact_outbound_pii:
     type: bool
     default: false

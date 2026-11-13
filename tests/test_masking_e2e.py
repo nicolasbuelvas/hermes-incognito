@@ -11,7 +11,6 @@ import string
 import pytest
 from hermes_sim import (
     SimHermes,
-    install_fake_hermes_middleware,
     load_plugin,
     scan_files,
 )
@@ -45,8 +44,7 @@ API_MODES = ["chat_completions", "codex_responses", "anthropic_messages"]
 
 
 @pytest.fixture
-def sim_factory(isolated_hermes_env, monkeypatch):
-    install_fake_hermes_middleware(monkeypatch)
+def sim_factory(isolated_hermes_env):
 
     def make(**kwargs):
         return SimHermes(plugin, isolated_hermes_env["home"], **kwargs)
@@ -309,12 +307,7 @@ def test_seeded_fuzz_pii_in_random_text_never_leaves(sim_factory, isolated_herme
         assert all(v not in b for b in blobs), v
 
 
-def test_execution_gate_blocks_even_without_hermes_internals(isolated_hermes_env, monkeypatch):
-    """If Hermes' _DownstreamExecutionError is unavailable, the gate escapes with a BaseException,
-    which Hermes' `except Exception` skip-and-send path cannot swallow."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+def test_execution_gate_returns_local_reply_without_calling_provider(isolated_hermes_env, monkeypatch):
     from hermes_sim import SimCtx
 
     ctx = SimCtx()
@@ -324,14 +317,14 @@ def test_execution_gate_blocks_even_without_hermes_internals(isolated_hermes_env
     gate = ctx.middleware["llm_execution"][0]
     request = {"messages": [{"role": "user", "content": USER_TEXT}]}
     monkeypatch.setattr(plugin_engine.pii, "mask_payload", lambda payload, vault, report=None: payload)
-    with pytest.raises(BaseException) as info:
-        try:
-            gate(request, sent.append, session_id="e2e-gate")
-        except Exception as exc:  # what Hermes would catch and then send anyway
-            pytest.fail(f"gate raised a plain Exception ({type(exc).__name__}); Hermes would send")
-    assert not isinstance(info.value, Exception)
+
+    response = gate(request, sent.append, session_id="e2e-gate")
+
+    message = response.choices[0].message.content
+    assert "couldn't confirm your personal details were masked" in message
+    assert response.content[0].text == response.output[0].content[0].text == message
     assert sent == []
-    assert all(c not in str(info.value) for c in CANARIES.values())
+    assert all(c not in message for c in CANARIES.values())
 
 
 def test_execution_gate_passes_clean_requests_unchanged_when_masking_is_off(isolated_hermes_env):

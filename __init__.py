@@ -1,6 +1,6 @@
 """Hermes Incognito Plugin.
 
-Zero-trace ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and Desktop.
+Ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and Desktop.
 Hides active chats from listings, blocks persistent memory mutations, strips profile
 memory in strict mode, optionally redacts outbound PII in RAM, and scrubs SQLite
 compression chains and transcript artifacts on close or TTL expiry.
@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 try:
@@ -33,34 +34,26 @@ logger = logging.getLogger(__name__)
 
 MASKING_BLOCKED_MESSAGE = (
     "Incognito didn't send this message because it couldn't mask your personal details. "
-    "Nothing left this computer. Try again, or turn off Mask personal details."
+    "Try again, or turn off Mask personal details."
 )
 
 
-class IncognitoSendBlocked(RuntimeError):
-    """Raised from the LLM execution middleware to stop a send that failed the masking check."""
-
-
-class _IncognitoSendAbort(BaseException):
-    """Last resort when Hermes' middleware internals are unavailable: escapes skip-on-error."""
-
-
-def _abort_send(message: str) -> None:
-    """Stop the provider call without letting Hermes skip this middleware and send anyway.
-
-    Hermes treats an ``Exception`` raised by an execution middleware as a plugin fault and calls the
-    next frame with the same payload (hermes_cli/middleware.py ``_run_execution_chain``). An error
-    wrapped in ``_DownstreamExecutionError`` is re-raised as-is, which ends the attempt with
-    ``message`` and no network call. Without that class, a ``BaseException`` is the only way out.
-    """
-    error = IncognitoSendBlocked(message)
-    try:
-        from hermes_cli.middleware import _DownstreamExecutionError  # type: ignore[attr-defined]
-    except Exception:
-        _DownstreamExecutionError = None
-    if _DownstreamExecutionError is not None:
-        raise _DownstreamExecutionError(error)
-    raise _IncognitoSendAbort(message)
+def _blocked_response(message: str) -> SimpleNamespace:
+    """Return a local reply from execution middleware without calling the provider."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(role="assistant", content=message, tool_calls=None),
+            finish_reason="stop",
+        )],
+        content=[SimpleNamespace(type="text", text=message)],
+        stop_reason="end_turn",
+        status="completed",
+        output=[SimpleNamespace(
+            type="message", role="assistant", status="completed",
+            content=[SimpleNamespace(type="output_text", text=message)],
+        )],
+        usage=None,
+    )
 
 
 def _resolve_session_id(kwargs: dict[str, Any], explicit: str = "") -> str:
@@ -239,7 +232,7 @@ def register(ctx: Any) -> None:
             logger.warning("Incognito masking gate failed (%s); blocking the send.", type(exc).__name__)
             payload, problem = None, MASKING_BLOCKED_MESSAGE
         if problem:
-            _abort_send(problem)
+            return _blocked_response(problem)
         return next_call(payload if payload is not None else request)
 
     ctx.register_middleware("llm_request", on_llm_request)
@@ -429,9 +422,9 @@ def register(ctx: Any) -> None:
                 return "Usage: /incognito verify <session_id>"
             res = engine.verify_zero_trace(target_id)
             if res.get("zero_trace"):
-                return f"Zero-trace verified for {target_id}: clean across DB, disk, and RAM."
+                return f"No tracked local artifacts found for {target_id}."
             return (
-                f"Residual traces found for {target_id}: "
+                f"Local cleanup check for {target_id}: "
                 f"DB rows={res.get('db_rows_found')}, "
                 f"Files={res.get('session_files_found')}, "
                 f"RAM={res.get('ram_vault_entries')}."
@@ -439,13 +432,13 @@ def register(ctx: Any) -> None:
 
         return (
             "Usage: /incognito [status|on|off|toggle|strict|mask [on|off]|save|undo|burn|sweep|ttl <min>|arm|verify <id>]\n"
-            "Control zero-trace ephemeral session privacy and sanitation."
+            "Manage privacy and cleanup for ephemeral chats."
         )
 
     ctx.register_command(
         name="incognito",
         handler=handle_slash_command,
-        description="Show or manage zero-trace incognito mode for this session",
+        description="Show or manage Incognito mode for this session",
         args_hint="[status|on|strict|off|toggle|mask|save|undo|burn|sweep|ttl <min>|arm|verify <id>]",
     )
 
@@ -656,24 +649,24 @@ def register(ctx: Any) -> None:
                 print(json.dumps(res, indent=2))
             else:
                 if res.get("zero_trace"):
-                    print(f"✓ Zero-trace verified for {target_sid}: No residual DB rows, disk files, or RAM vault entries found.")
+                    print(f"✓ No tracked local artifacts found for {target_sid}.")
                 else:
                     print(
-                        f"✗ Residual traces found for {target_sid}: "
+                        f"✗ Local cleanup check for {target_sid}: "
                         f"DB rows={res.get('db_rows_found')}, "
                         f"Session files={res.get('session_files_found')}, "
                         f"Hook files={res.get('hook_files_found')}, "
                         f"RAM entries={res.get('ram_vault_entries')}, "
                         f"Active lease={res.get('active_lease')}"
                     )
-            return 0
+            return 0 if res.get("zero_trace") else 1
 
         return 0
 
     if hasattr(ctx, "register_cli_command"):
         ctx.register_cli_command(
             name="incognito",
-            help="Manage incognito privacy sessions and zero-trace hygiene",
+            help="Manage Incognito sessions and local cleanup",
             setup_fn=setup_incognito_cli,
             handler_fn=handle_incognito_cli,
             description="Operator CLI for Hermes Incognito plugin.",
@@ -787,7 +780,7 @@ def register(ctx: Any) -> None:
             ctx.register_skill(
                 name="incognito-privacy",
                 path=skill_md,
-                description="Zero-trace incognito session commands, tools, and privacy patterns",
+                description="Incognito session commands, tools, and privacy patterns",
             )
         except Exception as exc:
             logger.debug("Failed to register incognito skill: %s", exc)
