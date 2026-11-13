@@ -13,3 +13,4 @@ build/
 Thumbs.db
 .env
 .env.*
+.hypothesis/

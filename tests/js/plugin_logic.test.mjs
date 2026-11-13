@@ -95,14 +95,22 @@ test('TTL line shows the idle deadline and time left', () => {
 })
 
 test('runPlan calls the explicit endpoints and never hits /toggle', async () => {
-  const ctx = fakeCtx()
+  const ctx = fakeCtx(on('standard'))
   await runPlan(ctx, { action: 'enable', session_id: 's1', mode: 'strict', redact_pii: true, switched: false })
-  await runPlan(ctx, { action: 'disable', session_id: 's1' })
   await runPlan(ctx, { action: 'arm', mode: 'standard' })
   await runPlan(ctx, { action: 'noop', reason: 'already', mode: 'standard' })
-  assert.deepEqual(ctx.calls.map(c => c.path), ['/enable', '/disable', '/arm'])
+  assert.deepEqual(ctx.calls.map(c => c.path), ['/enable', '/arm'])
   assert.deepEqual(ctx.calls[0].body, { session_id: 's1', mode: 'strict', redact_pii: true })
-  assert.equal(toasts.length, 4)
+  assert.equal(toasts.length, 3)
+})
+
+test('Turning Incognito off keeps the chat, so it asks first like Save', async () => {
+  const ctx = fakeCtx(on('standard'))
+  await runPlan(ctx, { action: 'disable', session_id: 's1' })
+  assert.equal(ctx.calls.filter(c => !c.path.startsWith('/status')).length, 0, 'no confirm, no change')
+  globalThis.window = { confirm: () => true }
+  await runPlan(ctx, { action: 'disable', session_id: 's1' })
+  assert.deepEqual(ctx.calls.filter(c => !c.path.startsWith('/status')).map(c => c.path), ['/save'])
 })
 
 test('runPlan reports backend failures instead of a success toast', async () => {
@@ -127,10 +135,12 @@ test('Keybind on a Strict chat turns Incognito off', async () => {
   plugin.register(ctx)
   const keybind = ctx.registered.find(c => c.id === 'keybind-toggle')
   setFocused('s1')
+  globalThis.window = { confirm: () => true }
   await keybind.data.run()
   const writes = ctx.calls.filter(c => !c.path.startsWith('/status'))
-  assert.deepEqual(writes, [{ path: '/disable', body: { session_id: 's1' } }])
-  assert.match(toasts.at(-1).message, /Incognito off/)
+  assert.deepEqual(writes, [{ path: '/save', body: { session_id: 's1' } }])
+  assert.match(toasts.at(-1).message, /saved to your history/)
+  assert.equal(toasts.at(-1).action.label, 'Undo')
 })
 
 test('Palette delete goes through the confirmation', async () => {

@@ -18,7 +18,9 @@ Operational procedures for ephemeral sessions, outbound PII redaction, tool muta
   - All guarantees of `standard`.
   - Blocks cross-session inspection tools (`session_search`, `cronjob_manage`).
   - Completely strips user profile and personal notes sections from outbound LLM prompts in RAM before sending.
-  - Reversible RAM-only PII redaction (masks emails, phone numbers, cards, synthetic secrets) is a separate `redact_pii` option available in both modes. It is off unless requested (`redact_pii=true`) or set by `redact_outbound_pii`; Hermes Desktop turns it on by default when it starts a Strict chat.
+  - Masking personal details is a separate `redact_pii` option available in both modes. Emails, phones, cards, IBANs, IDs (cédula/NIT/SSN), IPs, passwords, API keys, and street addresses become placeholders like `[EMAIL_1]` before anything is sent; a send that can't be checked is blocked. It is off unless requested (`redact_pii=true`) or set by `redact_outbound_pii`; Hermes Desktop turns it on by default when it starts a Strict chat.
+  - Placeholders in the conversation stand for real values the user has; refer to them by placeholder (for example "I'll email [EMAIL_1]"). Don't ask the user to repeat a masked value.
+  - Saving a chat to normal history is a user action (`/incognito save`, Desktop **Save this chat…**); it asks first and can be undone for a few minutes.
   - Enforces strict confirmation on outbound message dispatches (`send_message`).
 
 ## Tools & Commands

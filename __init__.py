@@ -31,6 +31,37 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger(__name__)
 
+MASKING_BLOCKED_MESSAGE = (
+    "Incognito didn't send this message because it couldn't mask your personal details. "
+    "Nothing left this computer. Try again, or turn off Mask personal details."
+)
+
+
+class IncognitoSendBlocked(RuntimeError):
+    """Raised from the LLM execution middleware to stop a send that failed the masking check."""
+
+
+class _IncognitoSendAbort(BaseException):
+    """Last resort when Hermes' middleware internals are unavailable: escapes skip-on-error."""
+
+
+def _abort_send(message: str) -> None:
+    """Stop the provider call without letting Hermes skip this middleware and send anyway.
+
+    Hermes treats an ``Exception`` raised by an execution middleware as a plugin fault and calls the
+    next frame with the same payload (hermes_cli/middleware.py ``_run_execution_chain``). An error
+    wrapped in ``_DownstreamExecutionError`` is re-raised as-is, which ends the attempt with
+    ``message`` and no network call. Without that class, a ``BaseException`` is the only way out.
+    """
+    error = IncognitoSendBlocked(message)
+    try:
+        from hermes_cli.middleware import _DownstreamExecutionError  # type: ignore[attr-defined]
+    except Exception:
+        _DownstreamExecutionError = None
+    if _DownstreamExecutionError is not None:
+        raise _DownstreamExecutionError(error)
+    raise _IncognitoSendAbort(message)
+
 
 def _resolve_session_id(kwargs: dict[str, Any], explicit: str = "") -> str:
     """Resolve session ID from argument, kwargs, or gateway context."""
@@ -77,13 +108,24 @@ def register(ctx: Any) -> None:
             engine.consume_armed_session(sid)
         engine.sweep_expired()
 
-    def pre_llm_call(session_id: str = "", is_first_turn: bool = False, **kwargs: Any) -> Optional[str]:
-        """Activate armed session if first turn and return context reminder."""
+    def pre_llm_call(session_id: str = "", is_first_turn: bool = False, **kwargs: Any) -> Any:
+        """Activate an armed session, mask this turn's messages, and return a context reminder.
+
+        Runs before Hermes titles the chat, compacts it, prefetches memory, or stores the turn, so
+        masking the message dicts here keeps original values out of those paths. A masking failure
+        vetoes the turn (no model call at all).
+        """
         sid = _resolve_session_id(kwargs, session_id)
         if not sid:
             return None
         if is_first_turn:
             engine.consume_armed_session(sid)
+        try:
+            if engine.masking_active(sid):
+                engine.mask_messages_in_place(sid, kwargs.get("conversation_history"))
+        except Exception as exc:
+            logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
+            return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}
         if engine.is_incognito(sid):
             engine.touch_session(sid)
             if is_first_turn:
@@ -104,9 +146,25 @@ def register(ctx: Any) -> None:
         session_id: str = "",
         **kwargs: Any,
     ) -> Optional[str]:
-        """Scrub active or pending-burn incognito sessions from cross-session search results."""
+        """Scrub protected sessions from search results, then mask personal details in the result.
+
+        Runs before the result joins the conversation, so the stored history and any later
+        compaction summary only ever see the masked text.
+        """
         sid = _resolve_session_id(kwargs, session_id)
-        return engine.scrub_tool_result(sid, tool_name, args, result)
+        scrubbed = engine.scrub_tool_result(sid, tool_name, args, result)
+        current = scrubbed if scrubbed is not None else result
+        try:
+            masked = engine.mask_tool_result(sid, current)
+        except Exception as exc:
+            logger.warning("Incognito could not mask a tool result (%s); withholding it.", type(exc).__name__)
+            return "[tool result withheld: Incognito couldn't mask personal details in it]"
+        return masked if masked is not None else scrubbed
+
+    def subagent_start(parent_session_id: str = "", child_session_id: Any = None, **kwargs: Any) -> None:
+        """A helper agent started from an Incognito chat inherits its protection and masking."""
+        if parent_session_id and child_session_id:
+            engine.adopt_subagent(str(parent_session_id), str(child_session_id))
 
     def post_compaction(old_session_id: str = "", session_id: str = "", **kwargs: Any) -> None:
         """Propagate incognito protection and in-RAM vaults to compacted sessions."""
@@ -127,6 +185,7 @@ def register(ctx: Any) -> None:
         sid = _resolve_session_id(kwargs, session_id)
         if not sid:
             return
+        engine.end_save_undo(sid)
         if engine.is_incognito(sid) and engine.get_settings().get("auto_purge_on_exit", True):
             if engine.live_head_for(sid):
                 # A compacted ancestor ends while its conversation continues in a live head.
@@ -147,6 +206,7 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("transform_tool_result", transform_tool_result)
     ctx.register_hook("post_compaction", post_compaction)
+    ctx.register_hook("subagent_start", subagent_start)
     ctx.register_hook("on_session_end", on_session_end)
     ctx.register_hook("on_session_finalize", on_session_cleanup)
     ctx.register_hook("on_session_reset", on_session_cleanup)
@@ -155,18 +215,32 @@ def register(ctx: Any) -> None:
     # 3. Register Middleware
     # -------------------------------------------------------------------------
     def on_llm_request(request: dict[str, Any], session_id: str = "", **kwargs: Any) -> Optional[dict[str, Any]]:
-        """Sanitize LLM requests with strict memory stripping and PII masking."""
+        """Sanitize LLM requests with strict memory stripping and PII masking. Never raises."""
         sid = _resolve_session_id(kwargs, session_id)
-        return engine.transform_llm_request(sid, request)
+        try:
+            return engine.transform_llm_request(sid, request)
+        except Exception as exc:
+            # Hermes would skip a raising middleware and send the request as-is; the execution
+            # gate below re-masks and re-checks the payload, so this request still can't leak.
+            logger.warning("Incognito request middleware failed (%s).", type(exc).__name__)
+            return None
 
     def on_llm_execution(
         request: dict[str, Any], next_call: Callable[[dict[str, Any]], Any], session_id: str = "", **kwargs: Any
     ) -> Any:
-        """Wrap LLM execution and restore in-RAM redacted PII placeholders."""
+        """Last gate before the provider: mask, re-check, and refuse to send on any doubt.
+
+        Model replies are passed through unchanged; placeholders are never swapped back.
+        """
         sid = _resolve_session_id(kwargs, session_id)
-        result = next_call(request)
-        restored = engine.transform_llm_response(sid, result)
-        return restored if restored is not None else result
+        try:
+            payload, problem = engine.guard_outbound(sid, request)
+        except Exception as exc:
+            logger.warning("Incognito masking gate failed (%s); blocking the send.", type(exc).__name__)
+            payload, problem = None, MASKING_BLOCKED_MESSAGE
+        if problem:
+            _abort_send(problem)
+        return next_call(payload if payload is not None else request)
 
     ctx.register_middleware("llm_request", on_llm_request)
     ctx.register_middleware("llm_execution", on_llm_execution)
@@ -278,6 +352,51 @@ def register(ctx: Any) -> None:
             engine.disarm_next_session()
             return "Disarmed pending next-session token."
 
+        if subcmd == "save":
+            if not sid:
+                return "No active session to save."
+            if not engine.is_incognito(sid):
+                return "This chat isn't in Incognito, so it's already saved."
+            if len(parts) < 2 or parts[1].lower() not in ("confirm", "yes"):
+                state = engine.get_session_state(sid) or {}
+                masked = (
+                    " Personal details stay masked in the saved messages; the real values aren't added back."
+                    if state.get("redact_pii") else ""
+                )
+                return (
+                    "Save this chat? It moves to your chat history and won't be deleted automatically."
+                    f"{masked} You can undo this for {engine.get_settings().get('save_undo_minutes', 10)} minutes "
+                    "or until you close the chat.\nRun /incognito save confirm to save it."
+                )
+            res = engine.save_session(sid)
+            if not res.get("ok"):
+                return str(res.get("error"))
+            _emit_state()
+            return (
+                f"Chat saved to your history. Run /incognito undo within {res['undo_seconds'] // 60} minutes "
+                "to bring it back to Incognito."
+            )
+
+        if subcmd == "undo":
+            if not sid:
+                return "No active session."
+            res = engine.undo_save(sid)
+            if not res.get("ok"):
+                return str(res.get("error"))
+            _emit_state()
+            return f"Back in Incognito ({res['mode']}). This chat will be deleted when you're done."
+
+        if subcmd == "mask":
+            if not sid or not engine.is_incognito(sid):
+                return "Turn on Incognito first: /incognito on"
+            want = (parts[1].lower() if len(parts) > 1 else "on") not in ("off", "no", "false")
+            state = engine.get_session_state(sid) or {}
+            res = engine.enable_session(sid, mode=state.get("mode", "standard"), redact_pii=want)
+            if not res.get("ok"):
+                return str(res.get("error"))
+            _emit_state()
+            return "Personal details will be masked before anything is sent." if want else "Masking is off for this chat."
+
         if subcmd == "arm":
             mode = "strict" if len(parts) > 1 and parts[1].lower() == "strict" else "standard"
             ttl = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
@@ -319,7 +438,7 @@ def register(ctx: Any) -> None:
             )
 
         return (
-            "Usage: /incognito [status|on|off|toggle|strict|burn|sweep|ttl <min>|arm|verify <id>]\n"
+            "Usage: /incognito [status|on|off|toggle|strict|mask [on|off]|save|undo|burn|sweep|ttl <min>|arm|verify <id>]\n"
             "Control zero-trace ephemeral session privacy and sanitation."
         )
 
@@ -327,7 +446,7 @@ def register(ctx: Any) -> None:
         name="incognito",
         handler=handle_slash_command,
         description="Show or manage zero-trace incognito mode for this session",
-        args_hint="[status|on|strict|off|toggle|burn|sweep|ttl <min>|arm|verify <id>]",
+        args_hint="[status|on|strict|off|toggle|mask|save|undo|burn|sweep|ttl <min>|arm|verify <id>]",
     )
 
     # Register direct subcommand aliases so TUI/CLI/Desktop '/' autocomplete popup
@@ -337,6 +456,9 @@ def register(ctx: Any) -> None:
         ("incognito-on", "on standard", "Enable standard ephemeral incognito mode for this session"),
         ("incognito-off", "off", "Disable incognito mode and retain conversation history"),
         ("incognito-burn", "burn", "Immediately scrub, zero-fill, and delete this session"),
+        ("incognito-save", "save", "Keep this chat: move it to normal history (asks first, can be undone)"),
+        ("incognito-undo", "undo", "Bring a just-saved chat back to Incognito"),
+        ("incognito-mask", "mask", "Mask personal details before anything is sent to the model"),
         ("incognito-status", "status", "Show active incognito mode, TTL, and blocked writes"),
         ("incognito-arm", "arm", "Arm the next new session to start in incognito mode"),
         ("incognito-sweep", "sweep", "Purge expired or orphaned incognito sessions"),
@@ -385,6 +507,15 @@ def register(ctx: Any) -> None:
         p_burn = subs.add_parser("burn", help="Burn and zero-scrub an incognito session")
         p_burn.add_argument("session_id", help="Session ID to burn")
         p_burn.add_argument("--json", action="store_true", dest="as_json", help="Output JSON format")
+
+        # save / undo
+        p_save = subs.add_parser("save", help="Keep an incognito chat in normal history (can be undone)")
+        p_save.add_argument("session_id", help="Session ID to save")
+        p_save.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+        p_save.add_argument("--json", action="store_true", dest="as_json", help="Output JSON format")
+        p_undo = subs.add_parser("undo", help="Bring a just-saved chat back to incognito")
+        p_undo.add_argument("session_id", help="Session ID to return to incognito")
+        p_undo.add_argument("--json", action="store_true", dest="as_json", help="Output JSON format")
 
         # verify
         p_verify = subs.add_parser("verify", help="Verify zero residual trace for a session")
@@ -481,6 +612,40 @@ def register(ctx: Any) -> None:
                 )
             return 0 if res["ok"] else 1
 
+        elif cmd == "save":
+            target_sid = getattr(args, "session_id", "")
+            if not getattr(args, "yes", False):
+                print(
+                    "Saving moves this chat to your history and stops its auto-delete timer. "
+                    "Masked details stay masked. You can undo it for a few minutes."
+                )
+                try:
+                    answer = input("Save this chat? [y/N] ").strip().lower()
+                except EOFError:
+                    answer = ""
+                if answer not in ("y", "yes"):
+                    print("Not saved.")
+                    return 1
+            res = engine.save_session(target_sid)
+            if as_json:
+                print(json.dumps(res, indent=2))
+            elif res.get("ok"):
+                print(f"✓ Saved {target_sid}. Undo with: hermes incognito undo {target_sid}")
+            else:
+                print(f"Not saved: {res.get('error')}")
+            return 0 if res.get("ok") else 1
+
+        elif cmd == "undo":
+            target_sid = getattr(args, "session_id", "")
+            res = engine.undo_save(target_sid)
+            if as_json:
+                print(json.dumps(res, indent=2))
+            elif res.get("ok"):
+                print(f"✓ {target_sid} is back in incognito ({res.get('mode')}).")
+            else:
+                print(f"Undo failed: {res.get('error')}")
+            return 0 if res.get("ok") else 1
+
         elif cmd == "verify":
             target_sid = getattr(args, "session_id", "")
             if not target_sid:
@@ -566,6 +731,16 @@ def register(ctx: Any) -> None:
             result = engine.disable_session(sid, action="keep")
             return {**engine.status_summary(sid), "ok": True} if result.get("ok") else result
 
+        def rpc_save(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+            sid = str((params or {}).get("session_id") or session_id or "").strip()
+            result = engine.save_session(sid)
+            return {**engine.status_summary(sid), **result} if result.get("ok") else result
+
+        def rpc_undo(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
+            sid = str((params or {}).get("session_id") or session_id or "").strip()
+            result = engine.undo_save(sid)
+            return {**engine.status_summary(sid), **result} if result.get("ok") else result
+
         def rpc_arm(params: Optional[dict[str, Any]] = None, *, session_id: str = "", **kwargs: Any) -> dict[str, Any]:
             p = params or {}
             if p.get("disarm"):
@@ -593,6 +768,8 @@ def register(ctx: Any) -> None:
             ctx.register_rpc("status", rpc_status)
             ctx.register_rpc("toggle", rpc_toggle)
             ctx.register_rpc("enable", rpc_enable)
+            ctx.register_rpc("save", rpc_save)
+            ctx.register_rpc("undo", rpc_undo)
             ctx.register_rpc("disable", rpc_disable)
             ctx.register_rpc("arm", rpc_arm)
             ctx.register_rpc("burn", rpc_burn)

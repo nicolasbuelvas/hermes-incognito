@@ -156,6 +156,40 @@ def disable_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     return {**eng.status_summary(session_id=session_id), "ok": True}
 
 
+def _session_body(body: Dict[str, Any]) -> str:
+    return str(body.get("session_id") or "").strip()
+
+
+@router.post("/save")
+def save_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    """Move an Incognito chat to normal history. Desktop asks for confirmation first."""
+    eng = _resolve_engine()
+    if eng is None:
+        return {"ok": False, "error": "engine unavailable"}
+    session_id = _session_body(body)
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+    result = eng.save_session(session_id)
+    if not result.get("ok"):
+        return result
+    return {**eng.status_summary(session_id=session_id), **result, "ok": True}
+
+
+@router.post("/undo")
+def undo_save(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
+    """Return a just-saved chat to Incognito with its earlier settings."""
+    eng = _resolve_engine()
+    if eng is None:
+        return {"ok": False, "error": "engine unavailable"}
+    session_id = _session_body(body)
+    if not session_id:
+        return {"ok": False, "error": "session_id required"}
+    result = eng.undo_save(session_id)
+    if not result.get("ok"):
+        return result
+    return {**eng.status_summary(session_id=session_id), **result, "ok": True}
+
+
 @router.post("/arm")
 def arm_session(body: Dict[str, Any] = Body(default_factory=dict)) -> Any:
     eng = _resolve_engine()

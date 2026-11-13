@@ -1,0 +1,504 @@
+{
+ "positives": [
+  {
+   "kind": "EMAIL",
+   "value": "juan.perez@gmail.com",
+   "text": "see juan.perez@gmail.com please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "a@b.co",
+   "text": "see a@b.co please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "first.last+tag@sub.example.org",
+   "text": "see first.last+tag@sub.example.org please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "USER_99@Empresa.COM.CO",
+   "text": "see USER_99@Empresa.COM.CO please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "x-y@domain-name.io",
+   "text": "see x-y@domain-name.io please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "maria_lopez@unal.edu.co",
+   "text": "see maria_lopez@unal.edu.co please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "oneil@example.com",
+   "text": "see oneil@example.com please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "test.user@mail.example.museum",
+   "text": "see test.user@mail.example.museum please"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "jdoe [at] acme [dot] org",
+   "text": "write to jdoe [at] acme [dot] org today"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "jdoe(at)acme(dot)com",
+   "text": "write to jdoe(at)acme(dot)com today"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "juan at gmail dot com",
+   "text": "escribe a juan at gmail dot com"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "maria.g at empresa dot co",
+   "text": "mail maria.g at empresa dot co now"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "pedro arroba hotmail punto com",
+   "text": "correo pedro arroba hotmail punto com"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "ana {at} proton {dot} me",
+   "text": "ping ana {at} proton {dot} me"
+  },
+  {
+   "kind": "EMAIL",
+   "value": "juan@x.org",
+   "text": "link mailto:juan@x.org"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+57 300 123 4567",
+   "text": "call me at +57 300 123 4567 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+573001234567",
+   "text": "call me at +573001234567 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "3001234567",
+   "text": "call me at 3001234567 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "300-123-4567",
+   "text": "call me at 300-123-4567 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "310 555 1234",
+   "text": "call me at 310 555 1234 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "(601) 234 5678",
+   "text": "call me at (601) 234 5678 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "604 444 1234",
+   "text": "call me at 604 444 1234 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+1 (415) 555-0132",
+   "text": "call me at +1 (415) 555-0132 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "415-555-0132",
+   "text": "call me at 415-555-0132 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "(212) 555 0199",
+   "text": "call me at (212) 555 0199 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+44 20 7946 0958",
+   "text": "call me at +44 20 7946 0958 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+34 612 34 56 78",
+   "text": "call me at +34 612 34 56 78 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+52 55 1234 5678",
+   "text": "call me at +52 55 1234 5678 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "0057 300 123 4567",
+   "text": "call me at 0057 300 123 4567 tonight"
+  },
+  {
+   "kind": "PHONE",
+   "value": "+49-30-1234567",
+   "text": "call me at +49-30-1234567 tonight"
+  },
+  {
+   "kind": "CARD",
+   "value": "4111 1111 1111 1111",
+   "text": "my card is 4111 1111 1111 1111, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "4111-1111-1111-1111",
+   "text": "my card is 4111-1111-1111-1111, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "4111111111111111",
+   "text": "my card is 4111111111111111, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "5500 0000 0000 0004",
+   "text": "my card is 5500 0000 0000 0004, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "3782 822463 10005",
+   "text": "my card is 3782 822463 10005, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "378282246310005",
+   "text": "my card is 378282246310005, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "6011 0009 9013 9424",
+   "text": "my card is 6011 0009 9013 9424, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "4012-8888-8888-1881",
+   "text": "my card is 4012-8888-8888-1881, exp 12/27"
+  },
+  {
+   "kind": "CARD",
+   "value": "4111 1111 1111 1112",
+   "text": "my card is 4111 1111 1111 1112, exp 12/27"
+  },
+  {
+   "kind": "IBAN",
+   "value": "GB82 WEST 1234 5698 7654 32",
+   "text": "transfer to GB82 WEST 1234 5698 7654 32 by friday"
+  },
+  {
+   "kind": "IBAN",
+   "value": "DE89370400440532013000",
+   "text": "transfer to DE89370400440532013000 by friday"
+  },
+  {
+   "kind": "IBAN",
+   "value": "ES91 2100 0418 4502 0005 1332",
+   "text": "transfer to ES91 2100 0418 4502 0005 1332 by friday"
+  },
+  {
+   "kind": "IBAN",
+   "value": "FR14 2004 1010 0505 0001 3M02 606",
+   "text": "transfer to FR14 2004 1010 0505 0001 3M02 606 by friday"
+  },
+  {
+   "kind": "IBAN",
+   "value": "NL91ABNA0417164300",
+   "text": "transfer to NL91ABNA0417164300 by friday"
+  },
+  {
+   "kind": "SSN",
+   "value": "123-45-6789",
+   "text": "my ssn is 123-45-6789"
+  },
+  {
+   "kind": "SSN",
+   "value": "078 05 1120",
+   "text": "number 078 05 1120 ok"
+  },
+  {
+   "kind": "SSN",
+   "value": "123456789",
+   "text": "SSN: 123456789"
+  },
+  {
+   "kind": "ID",
+   "value": "1.020.304.050",
+   "text": "mi cédula 1.020.304.050 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "80123456",
+   "text": "mi C.C. 80123456 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "1020304050",
+   "text": "mi CC 1020304050 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "79.123.456",
+   "text": "mi cedula de ciudadania No. 79.123.456 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "1032456789",
+   "text": "mi documento de identidad: 1032456789 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "AB1234567",
+   "text": "mi pasaporte AB1234567 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "12345678",
+   "text": "mi DNI 12345678 gracias"
+  },
+  {
+   "kind": "ID",
+   "value": "1001234567",
+   "text": "mi T.I. 1001234567 gracias"
+  },
+  {
+   "kind": "NIT",
+   "value": "900.123.456-7",
+   "text": "factura NIT 900.123.456-7 ok"
+  },
+  {
+   "kind": "NIT",
+   "value": "830.054.539-0",
+   "text": "proveedor 830.054.539-0 ok"
+  },
+  {
+   "kind": "NIT",
+   "value": "9001234567",
+   "text": "NIT: 9001234567"
+  },
+  {
+   "kind": "IP",
+   "value": "192.168.1.20",
+   "text": "host 192.168.1.20 is down"
+  },
+  {
+   "kind": "IP",
+   "value": "10.0.0.5",
+   "text": "host 10.0.0.5 is down"
+  },
+  {
+   "kind": "IP",
+   "value": "8.8.8.8",
+   "text": "host 8.8.8.8 is down"
+  },
+  {
+   "kind": "IP",
+   "value": "203.0.113.77",
+   "text": "host 203.0.113.77 is down"
+  },
+  {
+   "kind": "IP",
+   "value": "2001:db8::8a2e:370:7334",
+   "text": "host 2001:db8::8a2e:370:7334 is down"
+  },
+  {
+   "kind": "IP",
+   "value": "fe80::1ff:fe23:4567:890a",
+   "text": "host fe80::1ff:fe23:4567:890a is down"
+  },
+  {
+   "kind": "IP",
+   "value": "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+   "text": "host 2001:0db8:85a3:0000:0000:8a2e:0370:7334 is down"
+  },
+  {
+   "kind": "SECRET",
+   "value": "sk-proj-abcdefghijklmnopqrstuvwx123",
+   "text": "use sk-proj-abcdefghijklmnopqrstuvwx123 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx",
+   "text": "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "sk-abcdefghijklmnopqrstuvwxyz012345",
+   "text": "use sk-abcdefghijklmnopqrstuvwxyz012345 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+   "text": "use ghp_abcdefghijklmnopqrstuvwxyz0123456789 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
+   "text": "use github_pat_11ABCDEFG0123456789_abcdefghijklmnop for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "AKIAIOSFODNN7EXAMPLE",
+   "text": "use AKIAIOSFODNN7EXAMPLE for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "xoxb-123456789012-abcdefghijkl",
+   "text": "use xoxb-123456789012-abcdefghijkl for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+   "text": "use AIzaSyA1234567890abcdefghijklmnopqrstuv for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "glpat-abcdefghij1234567890",
+   "text": "use glpat-abcdefghij1234567890 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "sk_live_abcdefghijklmnop1234",
+   "text": "use sk_live_abcdefghijklmnop1234 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "hf_abcdefghijklmnopqrstuvwxyz12345",
+   "text": "use hf_abcdefghijklmnopqrstuvwxyz12345 for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+   "text": "use eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U for auth"
+  },
+  {
+   "kind": "SECRET",
+   "value": "abcdefghijklmnopqrstuvwxyz012345",
+   "text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345"
+  },
+  {
+   "kind": "SECRET",
+   "value": "s3cr3tP4ss",
+   "text": "postgres://admin:s3cr3tP4ss@db.internal:5432/app"
+  },
+  {
+   "kind": "SECRET",
+   "value": "9f8e7d6c5b4a3210",
+   "text": "api_key = 9f8e7d6c5b4a3210"
+  },
+  {
+   "kind": "SECRET",
+   "value": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234\nabcd\n-----END RSA PRIVATE KEY-----",
+   "text": "key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234\nabcd\n-----END RSA PRIVATE KEY-----\nthanks"
+  },
+  {
+   "kind": "PASSWORD",
+   "value": "hunter2",
+   "text": "password: hunter2"
+  },
+  {
+   "kind": "PASSWORD",
+   "value": "Tigre#2024",
+   "text": "mi contraseña es Tigre#2024"
+  },
+  {
+   "kind": "PASSWORD",
+   "value": "p@ss-W0rd!",
+   "text": "pwd=p@ss-W0rd!"
+  },
+  {
+   "kind": "PASSWORD",
+   "value": "4821",
+   "text": "my PIN is 4821"
+  },
+  {
+   "kind": "PASSWORD",
+   "value": "Clave123",
+   "text": "clave: Clave123"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "Calle 45 # 12-34 sur",
+   "text": "vivo en Calle 45 # 12-34 sur, Bogotá"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "Cra 7 No. 72-41",
+   "text": "oficina Cra 7 No. 72-41 piso 3"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "Av 68 # 22-15",
+   "text": "bodega Av 68 # 22-15"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "Carrera 15A # 93-07",
+   "text": "Carrera 15A # 93-07 apto 501"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "1600 Amphitheatre Parkway",
+   "text": "HQ is 1600 Amphitheatre Parkway, Mountain View"
+  },
+  {
+   "kind": "ADDRESS",
+   "value": "221 Baker Street",
+   "text": "visit 221 Baker Street in London"
+  }
+ ],
+ "negatives": [
+  "I have 3 apples and 12 oranges.",
+  "The meeting is on 2024-05-01 at 10:30.",
+  "Order 12345678 shipped.",
+  "pi is 3.14159 and e is 2.71828",
+  "Version 1.2.3 and 10.0.19041 released",
+  "Use port 8080 on localhost 127.0.0.1",
+  "look at this dot com",
+  "meet me at home dot com later?",
+  "Room 404 is on floor 3",
+  "Call me tomorrow",
+  "The year 1999 was great",
+  "Temperature 23.5 C",
+  "Score 7-3",
+  "ISBN 978-3-16-148410-0",
+  "time 12:30:45",
+  "Python 3.11.4 on Ubuntu 22.04",
+  "price $1,299.99",
+  "zip 110111",
+  "the [EMAIL_1] placeholder stays",
+  "token count is 12",
+  "a@b",
+  "user@localhost",
+  "sk-short",
+  "AKIA123",
+  "ghp_short",
+  "My pass to the park",
+  "Calle principal",
+  "15 minutes",
+  "chapter 3 section 2.4",
+  "1234 5678",
+  "+1",
+  "50% off",
+  "Matrix 3x3",
+  "IPv6 is great",
+  "C++ and C#",
+  "x = 10.5.2",
+  "The CC field in email",
+  "Call 911"
+ ]
+}

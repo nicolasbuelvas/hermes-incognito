@@ -19,6 +19,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "redact_outbound_pii": False,
     "provider_zdr_hints": True,
     "zero_fill_files": True,
+    "save_undo_minutes": 10,
 }
 
 

@@ -19,6 +19,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
+try:
+    from . import pii
+except ImportError:
+    import pii  # type: ignore[no-redef]
+
 # Allowed Hermes public API imports with fallbacks for standalone/pytest environments
 try:
     from hermes_constants import get_hermes_home
@@ -150,16 +155,6 @@ def _flat_hook_files(directory: Path, session_id: str) -> Iterator[Path]:
                 yield path
 
 
-# Common PII and credential patterns for in-RAM reversible vault
-_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-_PHONE_PATTERN = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
-_CARD_PATTERN = re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b")
-_SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-_BEARER_PATTERN = re.compile(r"\bBearer\s+([A-Za-z0-9_\-\.~+/=]{20,})\b")
-_SECRET_ASSIGN_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|private[_-]?key)\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.~+/=]{16,})[\"']?"
-)
-
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive without using os.kill(pid, 0) on Windows."""
     if pid <= 0:
@@ -221,12 +216,10 @@ class IncognitoEngine:
         self._lock = threading.RLock()
         self._explicit_home = Path(home_dir).expanduser().resolve() if home_dir else None
         self.config: dict[str, Any] = {}
-        # RAM-only reversible PII vaults: session_id -> {placeholder: original}
-        self._vaults: dict[str, dict[str, str]] = {}
-        # Reverse mapping: session_id -> {original: placeholder}
-        self._reverse_vaults: dict[str, dict[str, str]] = {}
-        # Kind counters: session_id -> {kind: count}
-        self._kind_counters: dict[str, dict[str, int]] = {}
+        # RAM-only masking vaults (placeholder <-> original), one per session. Never persisted.
+        self._vaults: dict[str, pii.Vault] = {}
+        # Saved chats that can still go back to Incognito: session_id -> undo record (RAM only).
+        self._saved: dict[str, dict[str, Any]] = {}
 
     @property
     def home_dir(self) -> Path:
@@ -334,6 +327,7 @@ class IncognitoEngine:
             "redact_outbound_pii": False,
             "provider_zdr_hints": True,
             "zero_fill_files": True,
+            "save_undo_minutes": 10,
         }
         try:
             cfg = load_config_readonly() or {}
@@ -582,9 +576,7 @@ class IncognitoEngine:
             for sid in released:
                 leases.pop(sid, None)
                 # Clear in-RAM vaults
-                self._vaults.pop(sid, None)
-                self._reverse_vaults.pop(sid, None)
-                self._kind_counters.pop(sid, None)
+                self._drop_vault(sid)
             self._write_leases(leases)
 
             return {"ok": True, "session_id": session_id, "mode": "off", "action": "keep"}
@@ -709,6 +701,7 @@ class IncognitoEngine:
                 "redactions": lease.get("redactions", 0),
                 "redact_pii": lease.get("redact_pii", False),
                 "started_at": lease.get("started_at"),
+                "masked_counts": self._vaults[session_id].counts() if session_id in self._vaults else {},
             }
 
     # -------------------------------------------------------------------------
@@ -777,6 +770,8 @@ class IncognitoEngine:
             leases = self._read_leases()
             old_lease = leases.get(old_session_id)
             if not old_lease:
+                if self.propagate_saved_compaction(old_session_id, new_session_id):
+                    return {"ok": True, "propagated": False, "saved": True, "session_id": new_session_id}
                 return {"ok": True, "propagated": False, "session_id": new_session_id}
 
             now = time.time()
@@ -798,13 +793,10 @@ class IncognitoEngine:
             old_lease["expires_at"] = None
             old_lease["lineage_ids"] = ancestor_lineage
 
-            # Clone in-RAM vault
+            # The new head continues the same conversation: share its masking vault so a value
+            # keeps its placeholder across the compaction.
             if old_session_id in self._vaults:
-                self._vaults[new_session_id] = dict(self._vaults[old_session_id])
-            if old_session_id in self._reverse_vaults:
-                self._reverse_vaults[new_session_id] = dict(self._reverse_vaults[old_session_id])
-            if old_session_id in self._kind_counters:
-                self._kind_counters[new_session_id] = dict(self._kind_counters[old_session_id])
+                self._vaults[new_session_id] = self._vaults[old_session_id]
 
             leases[new_session_id] = new_lease
             leases[old_session_id] = old_lease
@@ -1085,9 +1077,8 @@ class IncognitoEngine:
             else:
                 for sid in target_ids:
                     leases.pop(sid, None)
-                    vault_keys_cleared += len(self._vaults.pop(sid, {}))
-                    self._reverse_vaults.pop(sid, None)
-                    self._kind_counters.pop(sid, None)
+                    self._saved.pop(sid, None)
+                    vault_keys_cleared += self._drop_vault(sid)
             self._write_leases(leases)
 
             if pending_burn and _retry_attempt == 0:
@@ -1306,6 +1297,7 @@ class IncognitoEngine:
                 "session_state": current_state,
                 "current_session": current_state,
                 "armed": armed,
+                "saved": self.saved_state(session_id) if session_id else None,
                 "active_count": len(active_leases),
                 "active_sessions": [self._mask_id(sid) for sid in active_leases.keys()],
                 "audit": audit,
@@ -1347,6 +1339,7 @@ class IncognitoEngine:
                 "session_state": current_state,
                 "current_session": current_state,
                 "armed": self.get_armed_state(),
+                "saved": self.saved_state(session_id) if session_id else None,
                 "metrics": {
                     "blocked_writes": current_state.get("blocked_writes", 0) if current_state else 0,
                     "ram_redactions": current_state.get("redactions", 0) if current_state else 0,
@@ -1456,6 +1449,16 @@ class IncognitoEngine:
                             }
 
             if not is_caller_incog:
+                if session_id and self._saved_record(session_id) is not None:
+                    for t_name, _t_args in calls_to_check:
+                        if t_name in ("memory", "skill_manage"):
+                            return {
+                                "action": "block",
+                                "message": (
+                                    f"Tool '{t_name}' is blocked while this chat can still go back to "
+                                    "Incognito (Undo is available)."
+                                ),
+                            }
                 return None
 
             mode = caller_mode
@@ -1564,7 +1567,7 @@ class IncognitoEngine:
         return json.dumps(scrubbed, ensure_ascii=False)
 
     # -------------------------------------------------------------------------
-    # 18. transform_llm_request
+    # 17b. transform_llm_request
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -1599,121 +1602,196 @@ class IncognitoEngine:
         res = re.sub(r"\n{3,}", "\n\n", res)
         return res.strip()
 
-    def transform_llm_request(self, session_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
-        """Sanitize LLM requests: strip profile memory, redact PII, and attach ZDR hints."""
-        if not session_id or not isinstance(request, dict) or not self.is_incognito(session_id):
-            return None
+    # -------------------------------------------------------------------------
+    # 18. Personal-detail masking (fail-closed)
+    # -------------------------------------------------------------------------
 
+    def masking_active(self, session_id: str) -> bool:
+        """True when this session's outbound content must be masked."""
+        if not session_id:
+            return False
         with self._lock:
-            leases = self._read_leases()
-            lease = leases.get(session_id, {})
+            lease = self._read_leases().get(session_id)
+            if isinstance(lease, dict):
+                redact = lease.get("redact_pii")
+                if redact is None:
+                    redact = self.get_settings().get("redact_outbound_pii", False)
+                return bool(redact)
+            saved = self._saved_record(session_id)
+            return bool(saved and saved.get("redact_pii"))
+
+    def _vault_for(self, session_id: str) -> pii.Vault:
+        vault = self._vaults.get(session_id)
+        if vault is None:
+            vault = self._vaults[session_id] = pii.Vault()
+        return vault
+
+    def _drop_vault(self, session_id: str) -> int:
+        vault = self._vaults.pop(session_id, None)
+        if vault is None or any(v is vault for v in self._vaults.values()):
+            return 0
+        return vault.clear()
+
+    def store_vault_entry(self, session_id: str, placeholder: str, original: str) -> None:
+        with self._lock:
+            self._vault_for(session_id).set(placeholder, original)
+
+    def get_vault_entry(self, session_id: str, placeholder: str) -> str | None:
+        with self._lock:
+            vault = self._vaults.get(session_id)
+            return vault.get(placeholder) if vault is not None else None
+
+    def masked_counts(self, session_id: str) -> dict[str, int]:
+        """Highest placeholder number per kind. Content-free; Desktop numbers after these."""
+        with self._lock:
+            vault = self._vaults.get(session_id)
+            return vault.counts() if vault is not None else {}
+
+    def _count_redactions(self, session_id: str, count: int) -> None:
+        if count <= 0:
+            return
+        leases = self._read_leases()
+        if session_id in leases:
+            leases[session_id]["redactions"] = leases[session_id].get("redactions", 0) + count
+            self._write_leases(leases)
+        audit = self._read_audit()
+        audit["pii_redactions"] = audit.get("pii_redactions", 0) + count
+        self._write_audit(audit)
+
+    def mask_text(self, session_id: str, text: str) -> tuple[str, list[str]]:
+        """Mask one string with the session's vault. Raises if the masker fails."""
+        with self._lock:
+            return pii.mask_text(text, self._vault_for(session_id))
+
+    def mask_messages_in_place(self, session_id: str, messages: list[Any]) -> int:
+        """Mask the conversation Hermes is about to use for this turn, in place.
+
+        ``pre_llm_call`` receives the turn's message dicts before titling, turn-start compaction,
+        memory prefetch, and persistence read them, so masking them here keeps the original values out
+        of those paths too. Raises if the masker fails; the caller then blocks the turn.
+        """
+        if not self.masking_active(session_id) or not isinstance(messages, list):
+            return 0
+        total = 0
+        with self._lock:
+            vault = self._vault_for(session_id)
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                for text in pii.iter_strings(msg):
+                    vault.reserve(text)
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                total += self._mask_message_dict(msg, vault)
+            self._count_redactions(session_id, total)
+        return total
+
+    @staticmethod
+    def _mask_message_dict(msg: dict[str, Any], vault: pii.Vault) -> int:
+        count = 0
+        content = msg.get("content")
+        if isinstance(content, str):
+            masked, kinds = pii.mask_text(content, vault)
+            if kinds:
+                msg["content"] = masked
+                count += len(kinds)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    masked, kinds = pii.mask_text(part["text"], vault)
+                    if kinds:
+                        part["text"] = masked
+                        count += len(kinds)
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                masked, kinds = pii.mask_text(fn["arguments"], vault)
+                if kinds:
+                    fn["arguments"] = masked
+                    count += len(kinds)
+        meta = msg.get("display_metadata")
+        if isinstance(meta, dict):
+            for key, value in list(meta.items()):
+                if isinstance(value, str):
+                    masked, kinds = pii.mask_text(value, vault)
+                    if kinds:
+                        meta[key] = masked
+                        count += len(kinds)
+        return count
+
+    def mask_tool_result(self, session_id: str, result: Any) -> str | None:
+        """Mask a tool result before Hermes appends it to the conversation (and stores it)."""
+        if result is None or not self.masking_active(session_id):
+            return None
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        with self._lock:
+            masked, kinds = pii.mask_text(text, self._vault_for(session_id))
+            self._count_redactions(session_id, len(kinds))
+        return masked if (kinds or not isinstance(result, str)) else None
+
+    def _strict_strip(self, request: dict[str, Any]) -> bool:
+        changed = False
+
+        def walk(node: Any, key: str | None = None) -> Any:
+            nonlocal changed
+            if isinstance(node, str):
+                if key in ("content", "text", "system", "instructions"):
+                    updated = self._strip_memory_blocks(node) if re.search(r"(?i)(?:MEMORY|USER PROFILE)\s*\(", node) else node
+                    if updated != node:
+                        changed = True
+                    return updated
+                return node
+            if isinstance(node, list):
+                return [walk(item, key) for item in node]
+            if isinstance(node, dict):
+                return {k: (v if pii.skip_key(k, v) else walk(v, k)) for k, v in node.items()}
+            return node
+
+        for top in ("system", "instructions", "messages", "input"):
+            if top in request:
+                request[top] = walk(request[top], top if top in ("system", "instructions") else None)
+        return changed
+
+    def transform_llm_request(self, session_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        """Sanitize LLM requests: strip profile memory (strict), mask personal details, add ZDR hints.
+
+        Never raises. If masking fails, the request is replaced with a content-free stub and the
+        execution gate (:meth:`guard_outbound`) refuses to send it.
+        """
+        if not session_id or not isinstance(request, dict):
+            return None
+        # A saved chat inside its undo window is no longer Incognito but keeps masking.
+        if not self.is_incognito(session_id) and not self.masking_active(session_id):
+            return None
+        try:
+            return self._transform_llm_request(session_id, request)
+        except Exception as exc:
+            logger.warning("Incognito masking failed (%s); this request will not be sent.", type(exc).__name__)
+            return {"request": {"model": request.get("model"), "messages": []},
+                    "source": "incognito", "reason": "masking_failed"}
+
+    def _transform_llm_request(self, session_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            lease = self._read_leases().get(session_id) or {}
             mode = lease.get("mode", "standard")
             settings = self.get_settings()
-            redact_pii = lease.get("redact_pii")
-            if redact_pii is None:
-                redact_pii = settings.get("redact_outbound_pii", False)
-
             reasons: list[str] = []
             new_req = copy.deepcopy(request)
-            modified = False
 
-            def _apply_text_transform(container: dict[str, Any], fn: Callable[[str], str], reason_tag: str) -> None:
-                nonlocal modified
-                # Top-level string or block-list fields (Anthropic 'system', Codex 'instructions')
-                for top_key in ("system", "instructions"):
-                    val = container.get(top_key)
-                    if isinstance(val, str):
-                        updated = fn(val)
-                        if updated != val:
-                            container[top_key] = updated
-                            modified = True
-                            if reason_tag and reason_tag not in reasons:
-                                reasons.append(reason_tag)
-                    elif isinstance(val, list):
-                        for block in val:
-                            if isinstance(block, dict) and isinstance(block.get("text"), str):
-                                updated = fn(block["text"])
-                                if updated != block["text"]:
-                                    block["text"] = updated
-                                    modified = True
-                                    if reason_tag and reason_tag not in reasons:
-                                        reasons.append(reason_tag)
+            if mode == "strict" and self._strict_strip(new_req):
+                reasons.append("stripped_profile_memory")
 
-                # Message arrays (OpenAI/Gemini 'messages', Codex Responses 'input')
-                for list_key in ("messages", "input"):
-                    msgs = container.get(list_key)
-                    if not isinstance(msgs, list):
-                        continue
-                    for msg in msgs:
-                        if not isinstance(msg, dict):
-                            continue
-                        content = msg.get("content")
-                        if isinstance(content, str):
-                            updated = fn(content)
-                            if updated != content:
-                                msg["content"] = updated
-                                modified = True
-                                if reason_tag and reason_tag not in reasons:
-                                    reasons.append(reason_tag)
-                        elif isinstance(content, list):
-                            for part in content:
-                                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                                    updated = fn(part["text"])
-                                    if updated != part["text"]:
-                                        part["text"] = updated
-                                        modified = True
-                                        if reason_tag and reason_tag not in reasons:
-                                            reasons.append(reason_tag)
+            if self.masking_active(session_id):
+                report = pii.MaskReport()
+                new_req = pii.mask_payload(new_req, self._vault_for(session_id), report)
+                if report.masked:
+                    reasons.append("redacted_outbound_pii")
+                    self._count_redactions(session_id, report.masked)
+                if report.withheld:
+                    reasons.append("withheld_attachments")
 
-            # In strict mode, strip persistent memory sections from system/instructions/messages
-            if mode == "strict":
-                _apply_text_transform(new_req, self._strip_memory_blocks, "stripped_profile_memory")
-
-            # Outbound PII redaction via reversible vault
-            if redact_pii:
-                vault = self._vaults.setdefault(session_id, {})
-                reverse_vault = self._reverse_vaults.setdefault(session_id, {})
-                kind_counters = self._kind_counters.setdefault(session_id, {})
-
-                def _mask_value(original: str, kind: str) -> str:
-                    nonlocal modified
-                    if original in reverse_vault:
-                        return reverse_vault[original]
-                    kind_counters[kind] = kind_counters.get(kind, 0) + 1
-                    count = kind_counters[kind]
-                    placeholder = f"[REDACTED_{kind}_{count}]"
-                    vault[placeholder] = original
-                    reverse_vault[original] = placeholder
-                    modified = True
-                    return placeholder
-
-                def _redact_text(text: str) -> str:
-                    if not text:
-                        return text
-                    text = _EMAIL_PATTERN.sub(lambda m: _mask_value(m.group(0), "EMAIL"), text)
-                    text = _PHONE_PATTERN.sub(lambda m: _mask_value(m.group(0), "PHONE"), text)
-                    text = _CARD_PATTERN.sub(lambda m: _mask_value(m.group(0), "CARD"), text)
-                    text = _SSN_PATTERN.sub(lambda m: _mask_value(m.group(0), "SSN"), text)
-                    text = _BEARER_PATTERN.sub(lambda m: f"Bearer {_mask_value(m.group(1), 'SECRET')}", text)
-                    text = _SECRET_ASSIGN_PATTERN.sub(lambda m: f"{m.group(1)}={_mask_value(m.group(2), 'SECRET')}", text)
-                    return text
-
-                redaction_count_before = len(vault)
-                _apply_text_transform(new_req, _redact_text, "")
-
-                new_redactions = len(vault) - redaction_count_before
-                if new_redactions > 0:
-                    if "redacted_outbound_pii" not in reasons:
-                        reasons.append("redacted_outbound_pii")
-                    if session_id in leases:
-                        leases[session_id]["redactions"] = leases[session_id].get("redactions", 0) + new_redactions
-                        self._write_leases(leases)
-                    audit = self._read_audit()
-                    audit["pii_redactions"] = audit.get("pii_redactions", 0) + new_redactions
-                    self._write_audit(audit)
-
-            # Provider Zero Data Retention (ZDR) hints
-            if settings.get("provider_zdr_hints", True):
+            if settings.get("provider_zdr_hints", True) and lease:
                 base_url = str(request.get("base_url", "")).lower()
                 if "openrouter" in base_url:
                     extra_body = new_req.get("extra_body")
@@ -1727,71 +1805,295 @@ class IncognitoEngine:
                         extra_body["provider"] = provider
                         new_req["extra_body"] = extra_body
                         reasons.append("zdr_hint_openrouter")
-                        modified = True
-
                 if "store" in request and request.get("store") is not False:
                     new_req["store"] = False
                     reasons.append("zdr_hint_store_false")
-                    modified = True
 
-            if modified:
-                return {
-                    "request": new_req,
-                    "source": "incognito",
-                    "reason": ",".join(reasons) if reasons else "modified",
-                }
+            if new_req != request:
+                return {"request": new_req, "source": "incognito",
+                        "reason": ",".join(reasons) if reasons else "modified"}
             return None
+
+    def guard_outbound(self, session_id: str, request: Any) -> tuple[Any, str | None]:
+        """Final check on the exact payload about to be sent.
+
+        Returns ``(payload, None)`` to send ``payload`` (``None`` means unchanged), or
+        ``(None, message)`` to block. Masks once more, then re-scans: any detectable personal detail,
+        any value the vault already holds, or any unreadable attachment blocks the send.
+        """
+        if not self.masking_active(session_id):
+            return None, None
+        blocked = ("Incognito didn't send this message because it couldn't confirm your personal "
+                   "details were masked. Nothing left this computer.")
+        try:
+            with self._lock:
+                vault = self._vault_for(session_id)
+                report = pii.MaskReport()
+                masked = pii.mask_payload(request, vault, report)
+                problems = pii.verify_payload(masked, vault)
+                self._count_redactions(session_id, report.masked)
+        except Exception as exc:
+            logger.warning("Incognito masking check failed (%s); request blocked.", type(exc).__name__)
+            return None, blocked
+        if problems:
+            logger.warning("Incognito blocked a request: %s", ", ".join(problems))
+            return None, f"{blocked} ({', '.join(problems)})"
+        return masked, None
 
     # -------------------------------------------------------------------------
     # 19. transform_llm_response
     # -------------------------------------------------------------------------
 
     def transform_llm_response(self, session_id: str, response: Any) -> Any:
-        """Safely restore in-RAM redacted PII placeholders in LLM responses."""
-        if not session_id or response is None or not self.is_incognito(session_id):
-            return None
+        """Model replies are left as sent: placeholders are never swapped back for the originals.
 
+        Hermes stores replies in the transcript and passes tool-call arguments to tools, so restoring
+        originals here would write them to disk or hand them to services outside this computer.
+        Desktop shows which value each placeholder stands for, from memory, on this computer only.
+        """
+        return None
+
+    # -------------------------------------------------------------------------
+    # 20. Sub-agents
+    # -------------------------------------------------------------------------
+
+    def adopt_subagent(self, parent_session_id: str, child_session_id: str) -> dict[str, Any]:
+        """A sub-agent of an Incognito chat is Incognito too, with the same masking and vault.
+
+        The child is recorded as part of the parent's lineage, so it is deleted when the parent is,
+        and kept when the parent is kept.
+        """
+        if not (_valid_session_id(parent_session_id) and _valid_session_id(child_session_id)):
+            return {"ok": False, "error": "Invalid session ID."}
+        if parent_session_id == child_session_id:
+            return {"ok": False, "error": "A sub-agent needs its own session ID."}
         with self._lock:
-            vault = self._vaults.get(session_id)
-            if not vault:
-                return response
-            items = list(vault.items())
+            leases = self._read_leases()
+            parent = leases.get(parent_session_id)
+            saved = self._saved_record(parent_session_id)
+            if not isinstance(parent, dict):
+                if saved and saved.get("redact_pii"):
+                    # A saved chat inside its undo window: keep masking the helper's traffic.
+                    self._vaults[child_session_id] = self._vault_for(parent_session_id)
+                    saved.setdefault("subagents", []).append(child_session_id)
+                    return {"ok": True, "adopted": False, "masking": True}
+                return {"ok": True, "adopted": False}
+            now = time.time()
+            leases[child_session_id] = {
+                "session_id": child_session_id,
+                "mode": parent.get("mode", "standard"),
+                "redact_pii": parent.get("redact_pii", False),
+                "ttl_minutes": parent.get("ttl_minutes", 0),
+                "started_at": now,
+                "last_activity": now,
+                "expires_at": None,
+                "pid": os.getpid(),
+                "blocked_writes": 0,
+                "redactions": 0,
+                "lineage_ids": [child_session_id],
+                "compacted_into": parent_session_id,
+                "subagent_of": parent_session_id,
+            }
+            parent["lineage_ids"] = sorted(set((parent.get("lineage_ids") or []) + [child_session_id]))
+            leases[parent_session_id] = parent
+            self._write_leases(leases)
+            self._vaults[child_session_id] = self._vault_for(parent_session_id)
+        self.ensure_hidden_in_db(child_session_id)
+        return {"ok": True, "adopted": True, "session_id": child_session_id}
 
-        def _restore_text(s: str) -> str:
-            for placeholder, original in items:
-                if placeholder in s:
-                    s = s.replace(placeholder, original)
-            return s
+    # -------------------------------------------------------------------------
+    # 21. Save an Incognito chat, with undo
+    # -------------------------------------------------------------------------
 
-        def _restore_node(obj: Any) -> Any:
-            if isinstance(obj, str):
-                return _restore_text(obj)
-            elif isinstance(obj, dict):
-                return {k: _restore_node(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [_restore_node(elem) for elem in obj]
-            elif hasattr(obj, "content") and isinstance(obj.content, str):
+    def _saved_path(self) -> Path:
+        return self.data_dir / "saved.json"
+
+    def _read_saved(self) -> dict[str, Any]:
+        data = read_json_or_empty(self._saved_path())
+        return data if isinstance(data, dict) else {}
+
+    def _write_saved(self, saved: dict[str, Any]) -> None:
+        atomic_json_write(self._saved_path(), saved)
+
+    def _saved_record(self, session_id: str) -> dict[str, Any] | None:
+        """The undo record of a chat saved from Incognito, while undo is still available."""
+        if not session_id:
+            return None
+        with self._lock:
+            saved = self._read_saved()
+            rec = saved.get(session_id)
+            if not isinstance(rec, dict):
+                return None
+            if time.time() >= float(rec.get("undo_until") or 0):
+                self._finish_save(session_id)
+                return None
+            return rec
+
+    def _finish_save(self, session_id: str) -> None:
+        with self._lock:
+            saved = self._read_saved()
+            rec = saved.pop(session_id, None)
+            if rec is None:
+                return
+            self._write_saved(saved)
+            for sid in [session_id, *(rec.get("subagents") or [])]:
+                self._drop_vault(sid)
+
+    def save_session(self, session_id: str) -> dict[str, Any]:
+        """Move an Incognito chat to normal history and stop its auto-delete timer.
+
+        Builds on ``disable_session(action="keep")`` and keeps an undo record (content-free: ids,
+        times, and the lease settings) for ``save_undo_minutes`` or until the chat is closed.
+        While undo is available, masking stays on if it was on, and memory and skill writes stay
+        blocked, so undo can return the chat to Incognito without anything left outside it.
+        """
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
+        with self._lock:
+            leases = self._read_leases()
+            lease = leases.get(session_id)
+            if not isinstance(lease, dict):
+                return {"ok": False, "error": "This chat is not in Incognito."}
+            if lease.get("pending_burn"):
+                return {"ok": False, "error": "This chat is already being deleted."}
+            if _is_ancestor_lease(lease):
+                return {"ok": False, "error": "Save the current chat, not an earlier part of it."}
+            members = [session_id] + [
+                sid for sid in lease.get("lineage_ids", [])
+                if sid != session_id and _is_ancestor_lease(leases.get(sid)) and not leases[sid].get("pending_burn")
+            ]
+            snapshot = {sid: dict(leases[sid]) for sid in members}
+            masking_was_on = self.masking_active(session_id)
+            vaults = {sid: self._vaults.pop(sid) for sid in members if sid in self._vaults}
+            result = self.disable_session(session_id, action="keep")
+            if not result.get("ok"):
+                self._vaults.update(vaults)
+                return result
+            if session_id in vaults:
+                self._vaults[session_id] = vaults[session_id]
+                for sid in members:
+                    if sid in vaults and sid != session_id and vaults[sid] is vaults[session_id]:
+                        self._vaults[sid] = vaults[sid]
+            minutes = max(1, int(self.get_settings().get("save_undo_minutes", 10) or 10))
+            now = time.time()
+            record = {
+                "session_id": session_id,
+                "saved_at": now,
+                "undo_until": now + minutes * 60,
+                "mode": lease.get("mode", "standard"),
+                "redact_pii": masking_was_on,
+                "leases": snapshot,
+                "subagents": [sid for sid, snap in snapshot.items() if snap.get("subagent_of")],
+            }
+            saved = self._read_saved()
+            saved[session_id] = record
+            self._write_saved(saved)
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "saved": self.saved_state(session_id),
+                "mode": "off",
+                "undo_until": record["undo_until"],
+                "undo_seconds": minutes * 60,
+                "redact_pii": record["redact_pii"],
+            }
+
+    def undo_save(self, session_id: str) -> dict[str, Any]:
+        """Return a just-saved chat to Incognito with its lineage, TTL, and masking settings."""
+        if not _valid_session_id(session_id):
+            return {"ok": False, "error": "Invalid session ID."}
+        with self._lock:
+            rec = self._saved_record(session_id)
+            if rec is None:
+                return {"ok": False, "error": "Undo is no longer available for this chat."}
+            leases = self._read_leases()
+            now = time.time()
+            restored: dict[str, dict[str, Any]] = {}
+            for sid, snap in (rec.get("leases") or {}).items():
+                if not _valid_session_id(sid) or not isinstance(snap, dict):
+                    continue
+                lease = dict(snap)
+                lease["session_id"] = sid
+                lease.pop("pending_burn", None)
+                if not _is_ancestor_lease(lease):
+                    lease["last_activity"] = now
+                    ttl = lease.get("ttl_minutes", 0) or 0
+                    lease["expires_at"] = now + ttl * 60 if ttl > 0 else None
+                leases[sid] = lease
+                restored[sid] = lease
+            self._write_leases(leases)
+            saved = self._read_saved()
+            saved.pop(session_id, None)
+            self._write_saved(saved)
+            state_db = self.home_dir / "state.db"
+            if SessionDB is not None and state_db.exists():
                 try:
-                    obj.content = _restore_text(obj.content)
-                except Exception:
-                    pass
-                return obj
-            elif hasattr(obj, "choices") and isinstance(obj.choices, list):
-                for choice in obj.choices:
-                    if hasattr(choice, "message") and hasattr(choice.message, "content"):
-                        if isinstance(choice.message.content, str):
-                            try:
-                                choice.message.content = _restore_text(choice.message.content)
-                            except Exception:
-                                pass
-                return obj
-            return obj
+                    db = SessionDB(db_path=state_db)
+                    try:
+                        for sid, lease in restored.items():
+                            db.set_session_hidden(sid, True)
+                            db.patch_session_model_config(sid, {"incognito": lease})
+                    finally:
+                        if hasattr(db, "close"):
+                            db.close()
+                except Exception as exc:
+                    logger.debug("Cannot re-hide restored incognito session: %s", type(exc).__name__)
+            head = restored.get(session_id, {})
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "restored": True,
+                "mode": head.get("mode", "standard"),
+                "redact_pii": bool(head.get("redact_pii")),
+                "ttl_minutes": head.get("ttl_minutes", 0),
+            }
 
-        try:
-            return _restore_node(response)
-        except Exception as exc:
-            logger.debug("Failed to restore response vault values: %s", exc)
-            return response
+    def end_save_undo(self, session_id: str) -> None:
+        """Closing a saved chat ends its undo window."""
+        if session_id and isinstance(self._read_saved().get(session_id), dict):
+            self._finish_save(session_id)
+
+    def saved_state(self, session_id: str) -> dict[str, Any] | None:
+        rec = self._saved_record(session_id)
+        if rec is None:
+            return None
+        return {
+            "session_id": session_id,
+            "saved_at": rec.get("saved_at"),
+            "undo_until": rec.get("undo_until"),
+            "undo_remaining_seconds": max(0, int(float(rec.get("undo_until") or 0) - time.time())),
+            "mode": rec.get("mode"),
+            "redact_pii": bool(rec.get("redact_pii")),
+        }
+
+    def propagate_saved_compaction(self, old_session_id: str, new_session_id: str) -> bool:
+        """A saved chat compacted during its undo window: undo now restores the new head too."""
+        with self._lock:
+            saved = self._read_saved()
+            rec = saved.get(old_session_id)
+            if not isinstance(rec, dict) or not _valid_session_id(new_session_id):
+                return False
+            leases = rec.get("leases") or {}
+            head = dict(leases.get(old_session_id) or {})
+            lineage = sorted(set(list(head.get("lineage_ids") or []) + [old_session_id, new_session_id]))
+            old_lease = dict(head)
+            old_lease["compacted_into"] = new_session_id
+            old_lease["expires_at"] = None
+            old_lease["lineage_ids"] = sorted(set(lineage) - {new_session_id})
+            new_lease = dict(head)
+            new_lease.pop("compacted_into", None)
+            new_lease["session_id"] = new_session_id
+            new_lease["lineage_ids"] = lineage
+            leases[old_session_id] = old_lease
+            leases[new_session_id] = new_lease
+            rec["leases"] = leases
+            rec["session_id"] = new_session_id
+            saved.pop(old_session_id, None)
+            saved[new_session_id] = rec
+            self._write_saved(saved)
+            if old_session_id in self._vaults:
+                self._vaults[new_session_id] = self._vaults[old_session_id]
+            return True
 
 
 # -----------------------------------------------------------------------------
