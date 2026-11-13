@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-incognito"
-version = "1.0.0"
-description = "Ephemeral and incognito sessions plugin for Hermes Agent"
+version = "1.0.1"
+description = "Ephemeral clean-room sessions and fail-closed RAM PII masking plugin for Hermes Agent"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

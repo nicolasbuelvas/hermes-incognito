@@ -1,5 +1,5 @@
 name: incognito
-version: "1.0.0"
+version: "1.0.1"
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.0"
@@ -7,11 +7,10 @@ author: Nicolas Buelvas
 license: MIT
 homepage: https://github.com/nicolasbuelvas/hermes-incognito
 description: >-
-  Ephemeral and incognito sessions for Hermes CLI, TUI, Gateway, and
-  Desktop: hides active chats from sidebars and listings, blocks persistent
-  memory and skill mutations, strips profile memory in strict mode, optionally
-  redacts outbound PII in RAM, and scrubs SQLite compression chains and
-  transcript artifacts on close or on a sweep after TTL expiry.
+  Ephemeral clean-room chats and fail-closed RAM PII masking across Hermes CLI,
+  TUI, Gateway, and Desktop: hides active sessions from sidebars and searches,
+  blocks persistent memory and skill writes, strips profile memory in strict
+  mode, and scrubs SQLite compression chains and transcripts on close or sweep.
 tags:
   - privacy
   - incognito

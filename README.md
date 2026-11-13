@@ -1,6 +1,8 @@
 # Hermes Incognito
 
-Ephemeral sessions, outbound PII redaction, tool mutation guards, and local cleanup checks for Hermes Agent CLI, TUI, Gateway, and Desktop.
+Ephemeral clean-room sessions, fail-closed RAM PII masking, tool mutation guards, and verified local cleanup across Hermes Agent CLI, TUI, Gateway, and Desktop.
+
+![Hermes Incognito Desktop Integration — Strict clean-room banner, live draft masking preview, Sent to model payload inspector, Privacy Control Center, and confirmed cleanup](./assets/incognito-desktop-demo.gif)
 
 ## Architecture
 
