@@ -557,6 +557,9 @@ export function prefersReducedMotion() {
 // Per-chat vaults and the last masked send, kept in this window's memory only.
 const vaults = new Map()
 const sendListeners = new Set()
+// The first draft has no session ID. Keep only its counter high-water mark
+// so later sends cannot reuse its placeholders for different values.
+const firstDraftCounts = {}
 let lastSend = null
 
 export function vaultFor(sessionId, counts) {
@@ -642,9 +645,16 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
         notify('warning', MASK_BLOCKED.attachments)
         return null
       }
-      const vault = vaultFor(sessionId, masking.counts)
+      const vault = sessionId ? vaultFor(sessionId, masking.counts) : new Vault()
+      vault.seed(firstDraftCounts)
       const result = maskText(String(draft?.text ?? ''), vault)
       if (findPii(result.text).length) throw new Error('residual')
+      if (!sessionId) {
+        Object.assign(firstDraftCounts, vault.counters)
+        // The host has not assigned this draft to a chat yet.
+        setLastSend(null)
+        return { ...draft, text: result.text }
+      }
       setLastSend({
         sessionId,
         at: Date.now(),
@@ -661,7 +671,9 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
 }
 
 export function _resetMaskingForTests() {
+  for (const vault of vaults.values()) vault.clear()
   vaults.clear()
+  for (const kind of Object.keys(firstDraftCounts)) delete firstDraftCounts[kind]
   sendListeners.clear()
   lastSend = null
 }
@@ -1869,7 +1881,13 @@ export default {
   description: 'Hidden chats with local cleanup and optional profile and personal detail protection.',
   register(ctx) {
     const refreshAll = () => notifyStateListeners()
-    const unbind1 = ctx.onEvent?.('plugin.incognito.state.changed', refreshAll)
+    const unbind1 = ctx.onEvent?.('plugin.incognito.state.changed', event => {
+      const payload = event?.payload
+      if (payload?.burned === true && typeof payload.session_id === 'string' && payload.session_id) {
+        forgetChat(payload.session_id)
+      }
+      refreshAll()
+    })
     const unbind2 = ctx.onEvent?.('plugin.incognito.settings.changed', refreshAll)
 
     ctx.onDispose(() => {

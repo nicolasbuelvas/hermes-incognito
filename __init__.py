@@ -72,6 +72,14 @@ def _resolve_session_id(kwargs: dict[str, Any], explicit: str = "") -> str:
 def register(ctx: Any) -> None:
     """Entry point called by Hermes plugin loader to register capabilities."""
     engine = get_engine()
+    emit_to_session = getattr(ctx, "emit_to_session", None)
+    if callable(emit_to_session):
+        def notify_burned(session_id: str) -> None:
+            emit_to_session(session_id, "state.changed", {
+                "session_id": session_id, "active": False, "burned": True
+            })
+
+        engine.on_burn_complete = notify_burned
 
     # -------------------------------------------------------------------------
     # 1. Register Tools
@@ -191,11 +199,9 @@ def register(ctx: Any) -> None:
                 return
             reason = str(kwargs.get("hook_name") or "session_finalize")
             result = engine.burn_session(sid, reason=reason)
-            if result.get("ok") and hasattr(ctx, "emit_to_session"):
+            if result.get("ok") and result["pending_burn"] and callable(emit_to_session):
                 try:
-                    ctx.emit_to_session(sid, "state.changed", {
-                        "active": result["pending_burn"], "burned": not result["pending_burn"]
-                    })
+                    emit_to_session(sid, "state.changed", {"session_id": sid, "active": True, "burned": False})
                 except Exception:
                     pass
 

@@ -16,6 +16,7 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -218,12 +219,36 @@ class IncognitoEngine:
 
     def __init__(self, home_dir: Path | str | None = None) -> None:
         self._lock = threading.RLock()
+        self._lock_depth = 0
+        self.on_burn_complete: Callable[[str], None] | None = None
         self._explicit_home = Path(home_dir).expanduser().resolve() if home_dir else None
         self.config: dict[str, Any] = {}
         # RAM-only masking vaults (placeholder <-> original), one per session. Never persisted.
         self._vaults: dict[str, pii.Vault] = {}
         # Saved chats that can still go back to Incognito: session_id -> undo record (RAM only).
         self._saved: dict[str, dict[str, Any]] = {}
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize ledger transactions across Hermes processes and reentrant engine calls."""
+        with self._lock:
+            if self._lock_depth:
+                yield
+                return
+            with (self.data_dir / "state.lock").open("a+b") as lock_file:
+                if os.name == "nt":
+                    import msvcrt
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                self._lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth = 0
+                    # Closing the descriptor releases the OS lock on both platforms.
 
     @property
     def home_dir(self) -> Path:
@@ -304,7 +329,7 @@ class IncognitoEngine:
         atomic_json_write(self._audit_path(), audit)
 
     def _record_blocked_write(self, session_id: str) -> None:
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             if session_id in leases:
                 leases[session_id]["blocked_writes"] = leases[session_id].get("blocked_writes", 0) + 1
@@ -362,7 +387,7 @@ class IncognitoEngine:
 
     def set_session_expiry(self, session_id: str, expires_at: float) -> None:
         """Adjust session expiration deadline (used for TTL testing and manual sweeps)."""
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             if session_id in leases:
                 leases[session_id]["expires_at"] = expires_at
@@ -376,7 +401,7 @@ class IncognitoEngine:
         self, mode: str = "standard", ttl_minutes: int | None = None, redact_pii: bool | None = None
     ) -> dict[str, Any]:
         """Arm the next session to automatically start in incognito mode."""
-        with self._lock:
+        with self._locked():
             if mode not in ("standard", "strict"):
                 raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
             settings = self.get_settings()
@@ -397,7 +422,7 @@ class IncognitoEngine:
 
     def disarm_next_session(self) -> dict[str, Any]:
         """Cancel any armed token for the next session."""
-        with self._lock:
+        with self._locked():
             self._write_armed(None)
             return {"ok": True, "armed": None}
 
@@ -407,7 +432,7 @@ class IncognitoEngine:
 
     def get_armed_state(self) -> dict[str, Any] | None:
         """Inspect pending armed incognito configuration."""
-        with self._lock:
+        with self._locked():
             return self._read_armed()
 
     # -------------------------------------------------------------------------
@@ -418,7 +443,7 @@ class IncognitoEngine:
         """Activate incognito mode for session_id if armed or default_mode is active."""
         if not _valid_session_id(session_id):
             return None
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             if session_id in leases:
                 return leases[session_id]
@@ -465,7 +490,7 @@ class IncognitoEngine:
         if mode not in ("standard", "strict"):
             raise ValueError(f"Invalid mode '{mode}': must be 'standard' or 'strict'")
 
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             existing = leases.get(session_id)
             if isinstance(existing, dict) and existing.get("pending_burn"):
@@ -512,8 +537,8 @@ class IncognitoEngine:
 
             leases[session_id] = lease
             self._write_leases(leases)
-
             if newly_protected:
+                self._finish_save(session_id)
                 audit = self._read_audit()
                 audit["sessions_protected"] = audit.get("sessions_protected", 0) + 1
                 self._write_audit(audit)
@@ -536,7 +561,7 @@ class IncognitoEngine:
         if action == "burn":
             return self.burn_session(session_id, reason="disable_burn")
 
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id)
             if isinstance(lease, dict) and lease.get("pending_burn"):
@@ -613,7 +638,7 @@ class IncognitoEngine:
         """Update inactivity TTL in minutes for an active incognito session."""
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             if session_id not in leases:
                 return {"ok": False, "error": f"Session '{session_id}' is not currently incognito"}
@@ -668,13 +693,13 @@ class IncognitoEngine:
         """Check if a session is protected, including while cleanup is pending."""
         if not session_id:
             return False
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             return session_id in leases
 
     def get_protected_session_ids(self) -> set[str]:
         """Return all session IDs protected from cross-session search (active or pending burn)."""
-        with self._lock:
+        with self._locked():
             protected: set[str] = set()
             leases = self._read_leases()
             for sid, lease in leases.items():
@@ -707,7 +732,7 @@ class IncognitoEngine:
         if not session_id or not self.is_incognito(session_id):
             return None
 
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id)
             if not lease:
@@ -741,7 +766,7 @@ class IncognitoEngine:
         """Ensure an active incognito session stays hidden in SessionDB after turn writes."""
         if not session_id:
             return
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id)
             if not lease:
@@ -763,7 +788,7 @@ class IncognitoEngine:
         """Refresh session activity timestamp and extend expiration deadline."""
         if not session_id:
             return
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id)
             if isinstance(lease, dict) and not lease.get("pending_burn") and not _is_ancestor_lease(lease):
@@ -778,7 +803,7 @@ class IncognitoEngine:
 
     def live_head_for(self, session_id: str) -> str | None:
         """Return the live session that continues a compacted ancestor, if any."""
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             if not _is_ancestor_lease(leases.get(session_id)):
                 return None
@@ -797,7 +822,7 @@ class IncognitoEngine:
         if old_session_id == new_session_id:
             return {"ok": False, "error": "Compaction requires a new session ID."}
 
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             old_lease = leases.get(old_session_id)
             if not old_lease:
@@ -893,7 +918,7 @@ class IncognitoEngine:
 
         def _retry() -> None:
             try:
-                with self._lock:
+                with self._locked():
                     leases = self._read_leases()
                     lease = leases.get(session_id)
                     if not lease or not lease.get("pending_burn"):
@@ -986,7 +1011,7 @@ class IncognitoEngine:
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
 
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id, {})
             authorized_leases: dict[str, dict[str, Any]] = {}
@@ -1144,6 +1169,13 @@ class IncognitoEngine:
                 audit.setdefault("receipts", []).append(receipt)
             self._write_audit(audit)
 
+            if not pending_burn and self.on_burn_complete is not None:
+                for sid in sorted(target_ids):
+                    try:
+                        self.on_burn_complete(sid)
+                    except Exception:
+                        logger.debug("Could not notify Desktop about completed Incognito cleanup")
+
             return {
                 "ok": True,
                 "session_id": session_id,
@@ -1163,7 +1195,7 @@ class IncognitoEngine:
 
     def sweep_expired(self, force_dead_pids: bool = True) -> dict[str, Any]:
         """Sweep expired TTL leases and orphaned sessions from dead processes."""
-        with self._lock:
+        with self._locked():
             now = time.time()
             leases = self._read_leases()
             to_burn: dict[str, str] = {}
@@ -1255,7 +1287,7 @@ class IncognitoEngine:
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
 
-        with self._lock:
+        with self._locked():
             db_rows_found = self._count_db_rows_for_ids(self.home_dir / "state.db", {session_id})
 
             sessions_dir = self.home_dir / "sessions"
@@ -1316,7 +1348,7 @@ class IncognitoEngine:
         """
         if not include_global:
             return self._session_status(session_id)
-        with self._lock:
+        with self._locked():
             current_state = self.get_session_state(session_id) if session_id else None
             armed = self.get_armed_state()
             leases = self._read_leases()
@@ -1363,7 +1395,7 @@ class IncognitoEngine:
 
     def _session_status(self, session_id: str) -> dict[str, Any]:
         """Status for a single session without other sessions or host-wide audit data."""
-        with self._lock:
+        with self._locked():
             current_state = self.get_session_state(session_id) if _valid_session_id(session_id) else None
             settings = self.get_settings()
             is_active = bool(current_state and current_state.get("active"))
@@ -1402,7 +1434,7 @@ class IncognitoEngine:
         self, session_id: str, tool_name: str, args: dict[str, Any] | None = None
     ) -> dict[str, str] | None:
         """Enforce tool execution boundaries for incognito sessions and cross-session reads."""
-        with self._lock:
+        with self._locked():
             calls_to_check: list[tuple[str, dict[str, Any]]] = []
             if tool_name == "tool_call" and isinstance(args, dict) and isinstance(args.get("calls"), list):
                 for entry in args["calls"]:
@@ -1650,7 +1682,7 @@ class IncognitoEngine:
         """True when this session's outbound content must be masked."""
         if not session_id:
             return False
-        with self._lock:
+        with self._locked():
             lease = self._read_leases().get(session_id)
             if isinstance(lease, dict):
                 redact = lease.get("redact_pii")
@@ -1673,17 +1705,17 @@ class IncognitoEngine:
         return vault.clear()
 
     def store_vault_entry(self, session_id: str, placeholder: str, original: str) -> None:
-        with self._lock:
+        with self._locked():
             self._vault_for(session_id).set(placeholder, original)
 
     def get_vault_entry(self, session_id: str, placeholder: str) -> str | None:
-        with self._lock:
+        with self._locked():
             vault = self._vaults.get(session_id)
             return vault.get(placeholder) if vault is not None else None
 
     def masked_counts(self, session_id: str) -> dict[str, int]:
         """Highest placeholder number per kind. Content-free; Desktop numbers after these."""
-        with self._lock:
+        with self._locked():
             vault = self._vaults.get(session_id)
             return vault.counts() if vault is not None else {}
 
@@ -1700,7 +1732,7 @@ class IncognitoEngine:
 
     def mask_text(self, session_id: str, text: str) -> tuple[str, list[str]]:
         """Mask one string with the session's vault. Raises if the masker fails."""
-        with self._lock:
+        with self._locked():
             return pii.mask_text(text, self._vault_for(session_id))
 
     def mask_messages_in_place(self, session_id: str, messages: list[Any]) -> int:
@@ -1713,7 +1745,7 @@ class IncognitoEngine:
         if not self.masking_active(session_id) or not isinstance(messages, list):
             return 0
         total = 0
-        with self._lock:
+        with self._locked():
             vault = self._vault_for(session_id)
             for msg in messages:
                 if not isinstance(msg, dict):
@@ -1765,7 +1797,7 @@ class IncognitoEngine:
         if result is None or not self.masking_active(session_id):
             return None
         text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        with self._lock:
+        with self._locked():
             masked, kinds = pii.mask_text(text, self._vault_for(session_id))
             self._count_redactions(session_id, len(kinds))
         return masked if (kinds or not isinstance(result, str)) else None
@@ -1812,7 +1844,7 @@ class IncognitoEngine:
                     "source": "incognito", "reason": "masking_failed"}
 
     def _transform_llm_request(self, session_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
-        with self._lock:
+        with self._locked():
             lease = self._read_leases().get(session_id) or {}
             mode = lease.get("mode", "standard")
             settings = self.get_settings()
@@ -1866,7 +1898,7 @@ class IncognitoEngine:
         blocked = ("Incognito didn't send this message because it couldn't confirm your personal "
                    "details were masked.")
         try:
-            with self._lock:
+            with self._locked():
                 vault = self._vault_for(session_id)
                 report = pii.MaskReport()
                 masked = pii.mask_payload(request, vault, report)
@@ -1907,7 +1939,7 @@ class IncognitoEngine:
             return {"ok": False, "error": "Invalid session ID."}
         if parent_session_id == child_session_id:
             return {"ok": False, "error": "A sub-agent needs its own session ID."}
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             parent = leases.get(parent_session_id)
             record = self._saved_record(parent_session_id) if not isinstance(parent, dict) else None
@@ -1973,7 +2005,7 @@ class IncognitoEngine:
         """The undo record of a chat saved from Incognito, while undo is still available."""
         if not session_id:
             return None
-        with self._lock:
+        with self._locked():
             saved = self._read_saved()
             rec = saved.get(session_id)
             if not isinstance(rec, dict):
@@ -1989,7 +2021,7 @@ class IncognitoEngine:
             return rec
 
     def _finish_save(self, session_id: str) -> None:
-        with self._lock:
+        with self._locked():
             saved = self._read_saved()
             rec = saved.pop(session_id, None)
             if rec is None:
@@ -2009,7 +2041,7 @@ class IncognitoEngine:
         """
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
-        with self._lock:
+        with self._locked():
             leases = self._read_leases()
             lease = leases.get(session_id)
             if not isinstance(lease, dict):
@@ -2063,13 +2095,13 @@ class IncognitoEngine:
         """Return a just-saved chat to Incognito with its lineage, TTL, and masking settings."""
         if not _valid_session_id(session_id):
             return {"ok": False, "error": "Invalid session ID."}
-        with self._lock:
+        with self._locked():
             rec = self._saved_record(session_id)
             if rec is None or rec.get("session_id") != session_id:
                 return {"ok": False, "error": "Undo is no longer available for this chat."}
             leases = self._read_leases()
-            if leases.get(session_id, {}).get("pending_burn"):
-                return {"ok": False, "error": "This chat is already being deleted."}
+            if session_id in leases:
+                return {"ok": False, "error": "This chat is already in Incognito or being deleted."}
             now = time.time()
             restored: dict[str, dict[str, Any]] = {}
             for sid, snap in (rec.get("leases") or {}).items():
@@ -2090,11 +2122,14 @@ class IncognitoEngine:
                 return {"ok": False, "error": "Could not restore Incognito in chat history. Try again."}
             try:
                 self._write_leases(leases)
-                saved = self._read_saved()
-                saved.pop(session_id, None)
-                self._write_saved(saved)
             except OSError:
                 return {"ok": False, "error": "Could not finish restoring Incognito. Try again."}
+            saved = self._read_saved()
+            saved.pop(session_id, None)
+            try:
+                self._write_saved(saved)
+            except OSError:
+                logger.warning("Could not remove the completed Incognito undo record")
             head = restored.get(session_id, {})
             return {
                 "ok": True,
@@ -2111,9 +2146,12 @@ class IncognitoEngine:
             self._finish_save(session_id)
 
     def saved_state(self, session_id: str) -> dict[str, Any] | None:
-        rec = self._saved_record(session_id)
-        if rec is None or rec.get("session_id") != session_id:
-            return None
+        with self._locked():
+            if self.is_incognito(session_id):
+                return None
+            rec = self._saved_record(session_id)
+            if rec is None or rec.get("session_id") != session_id:
+                return None
         return {
             "session_id": session_id,
             "saved_at": rec.get("saved_at"),
@@ -2125,7 +2163,7 @@ class IncognitoEngine:
 
     def propagate_saved_compaction(self, old_session_id: str, new_session_id: str) -> bool:
         """A saved chat compacted during its undo window: undo now restores the new head too."""
-        with self._lock:
+        with self._locked():
             rec = self._saved_record(old_session_id)
             if rec is None or not _valid_session_id(new_session_id):
                 return False

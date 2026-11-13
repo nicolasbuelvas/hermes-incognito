@@ -305,3 +305,36 @@ test('palette offers save and undo', () => {
   assert.ok(ctx.registered.find(c => c.id === 'palette-save'))
   assert.ok(ctx.registered.find(c => c.id === 'palette-undo-save'))
 })
+
+test('a first draft does not leave originals in an unassigned chat or reuse its placeholders', async () => {
+  const first = makeMaskingMiddleware(fakeCtx({ armed: { mode: 'strict', redact_pii: true } }))
+  assert.equal((await first({ text: 'first@example.org' })).text, '[EMAIL_1]')
+  assert.equal(getLastSend(), null)
+  assert.equal(vaultFor('').size, 0)
+
+  setFocused('new-chat')
+  const followup = makeMaskingMiddleware(fakeCtx(status()))
+  assert.equal((await followup({ text: 'next@example.org' })).text, '[EMAIL_2]')
+  assert.equal(vaultFor('new-chat').get('[EMAIL_2]'), 'next@example.org')
+})
+
+test('a completed burn event clears only the deleted chat from Desktop memory', async () => {
+  const ctx = fakeCtx(status())
+  const callbacks = new Map()
+  ctx.onEvent = (name, callback) => callbacks.set(name, callback)
+  plugin.register(ctx)
+
+  maskText('other@example.org', vaultFor('other'))
+  setFocused('delete-me')
+  const send = makeMaskingMiddleware(ctx)
+  await send({ text: 'delete@example.org' })
+  const vault = vaultFor('delete-me')
+  const onStateChanged = callbacks.get('plugin.incognito.state.changed')
+  onStateChanged({ payload: { session_id: 'delete-me', burned: false, active: true } })
+  assert.equal(vault.size, 1)
+
+  onStateChanged({ payload: { session_id: 'delete-me', burned: true, active: false } })
+  assert.equal(vault.size, 0)
+  assert.equal(getLastSend(), null)
+  assert.equal(vaultFor('other').size, 1)
+})

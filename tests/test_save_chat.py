@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import time
 
 import pytest
@@ -398,3 +399,68 @@ def test_enable_fails_if_existing_chat_cannot_be_hidden_and_armed_turn_can_retry
     assert _hidden(db, "existing")
     assert eng.get_armed_state() is None
     assert messages[0]["content"] == "[EMAIL_1]"
+
+def _enable_in_process(home, sid, ready, release, results):
+    engine = plugin_engine.IncognitoEngine(home)
+    write = engine._write_leases
+
+    def pause_before_write(leases):
+        ready.set()
+        if release is not None and not release.wait(10):
+            raise TimeoutError("activation test did not release first writer")
+        write(leases)
+
+    engine._write_leases = pause_before_write
+    results.put(engine.enable_session(sid)["ok"])
+
+
+def test_processes_keep_both_leases_when_activations_overlap(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    first_ready, second_ready, release = ctx.Event(), ctx.Event(), ctx.Event()
+    results = ctx.Queue()
+    first = ctx.Process(target=_enable_in_process, args=(tmp_path, "first", first_ready, release, results))
+    second = ctx.Process(target=_enable_in_process, args=(tmp_path, "second", second_ready, None, results))
+    first.start()
+    try:
+        assert first_ready.wait(10)
+        second.start()
+        assert not second_ready.wait(1), "second process entered the first process's transaction"
+    finally:
+        release.set()
+        for worker in (first, second):
+            if worker.pid is None:
+                continue
+            worker.join(10)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+    assert first.exitcode == second.exitcode == 0
+    assert results.get(timeout=5) and results.get(timeout=5)
+    engine = plugin_engine.IncognitoEngine(tmp_path)
+    assert engine.is_incognito("first") and engine.is_incognito("second")
+
+
+def test_reactivating_incognito_retires_older_undo(eng, db):
+    _start(eng, db, "old-undo", mode="standard", redact_pii=False)
+    assert eng.save_session("old-undo")["ok"]
+    assert eng.enable_session("old-undo", mode="strict", redact_pii=True)["ok"]
+    assert eng.saved_state("old-undo") is None
+    assert not eng.undo_save("old-undo")["ok"]
+    assert eng.get_session_state("old-undo")["mode"] == "strict"
+    assert eng.masking_active("old-undo")
+
+
+@pytest.mark.parametrize("action", ["finalize", "sweep"])
+def test_completed_automatic_burn_notifies_desktop(eng, db, clock, action):
+    ctx = SimCtx()
+    plugin.register(ctx)
+    _start(eng, db, "auto", ttl_minutes=1, redact_pii=True)
+    eng.mask_text("auto", EMAIL)
+    if action == "finalize":
+        ctx.hooks["on_session_finalize"][0](session_id="auto")
+    else:
+        clock["now"] += 61
+        assert eng.sweep_expired()["swept_count"] == 1
+
+    assert ("auto", "state.changed", {"session_id": "auto", "active": False, "burned": True}) in ctx.events
+    assert eng.verify_zero_trace("auto")["zero_trace"]
