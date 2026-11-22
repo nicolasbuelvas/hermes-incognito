@@ -22,7 +22,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 try:
     from . import pii
@@ -224,6 +224,15 @@ def _live_head_for(leases: dict[str, Any], session_id: str) -> str | None:
         ):
             return sid
     return None
+
+
+def _is_local_retaindb_url(base_url: str) -> bool:
+    """True for a localhost/loopback RetainDB base_url (served without auth)."""
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
 
 
 class IncognitoActivationError(RuntimeError):
@@ -1270,6 +1279,10 @@ class IncognitoEngine:
 
         Mirrors the RetainDB provider's resolution: scoped secrets first, then the
         ``memory.retaindb`` config block, then the provider's profile fallback.
+
+        Local endpoints (localhost/loopback) are served without auth, so a missing
+        ``RETAINDB_API_KEY`` only skips a remote store; a configured local store still
+        resolves so the burn can purge it.
         """
         try:
             api_key = get_secret("RETAINDB_API_KEY", "") or ""
@@ -1277,8 +1290,6 @@ class IncognitoEngine:
             project = get_secret("RETAINDB_PROJECT", "") or ""
         except Exception:
             api_key, base_url, project = "", "", ""
-        if not api_key:
-            return None
         if not base_url or not project:
             try:
                 block = (load_config_readonly() or {}).get("memory", {}).get("retaindb", {}) or {}
@@ -1286,7 +1297,11 @@ class IncognitoEngine:
                 project = project or str(block.get("project") or "")
             except Exception:
                 pass
-        base_url = re.sub(r"/+$", "", base_url or "https://api.retaindb.com")
+        base_url = re.sub(r"/+$", "", base_url or "")
+        if not api_key and not _is_local_retaindb_url(base_url):
+            return None
+        if not base_url:
+            base_url = "https://api.retaindb.com"
         if not project:
             profile = os.path.basename(str(self.home_dir))
             project = f"hermes-{profile}" if profile not in {"", ".hermes"} else "default"
@@ -1309,7 +1324,10 @@ class IncognitoEngine:
             return {"skipped": "retaindb not configured"}
         base_url, project, api_key = endpoints
         token = api_key.replace("Bearer ", "").strip()
-        headers = {"Authorization": f"Bearer {token}", "X-API-Key": token, "x-sdk-runtime": "hermes-incognito"}
+        headers = {"x-sdk-runtime": "hermes-incognito"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-API-Key"] = token
         deadline = time.monotonic() + self._ARCHIVE_PURGE_DEADLINE_S
         purged = 0
         try:
@@ -1341,6 +1359,31 @@ class IncognitoEngine:
         except Exception as exc:
             logger.debug("Incognito archive purge failed (log-only, burn unaffected): %s", exc)
             return {"purged": purged, "error": str(exc)}
+
+    def _count_retaindb_memories(self, session_id: str) -> Tuple[Optional[int], str]:
+        """Count *session_id*'s memories in the RetainDB archive store.
+
+        Returns ``(count, status)``: count is an int for a reachable configured store,
+        or None when unconfigured/unreachable (status explains why). A None count means
+        "unknown", not "clean" — verify_zero_trace must not veto the verdict on it.
+        """
+        endpoints = self._retaindb_endpoints()
+        if endpoints is None:
+            return None, "not_configured"
+        base_url, project, api_key = endpoints
+        token = api_key.replace("Bearer ", "").strip()
+        headers = {"x-sdk-runtime": "hermes-incognito"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-API-Key"] = token
+        list_url = f"{base_url}/v1/memory/session/{quote(session_id, safe='')}?project={quote(project)}&include_pending=false"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(list_url, headers=headers), timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            items = payload.get("memories") if isinstance(payload, dict) else payload
+            return (len(items) if items else 0), "ok"
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
 
     # ---------------------------------------------------------------------
     # 13b. LCM store purge (Gate 3b)
@@ -1480,6 +1523,11 @@ class IncognitoEngine:
             leases = self._read_leases()
             active_lease = session_id in leases
 
+            # Archive-store probe: a configured store with surviving memories is a real
+            # trace; an unknown (unconfigured/unreachable) store does not veto the verdict.
+            retaindb_count, retaindb_status = self._count_retaindb_memories(session_id)
+            retaindb_clean = retaindb_count in (0, None)
+
             session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
             audit = self._read_audit()
             burn_receipt = None
@@ -1494,6 +1542,7 @@ class IncognitoEngine:
                 and hook_files_found == 0
                 and ram_vault_entries == 0
                 and not active_lease
+                and retaindb_clean
             )
 
             return {
@@ -1505,6 +1554,8 @@ class IncognitoEngine:
                 "hook_files_found": hook_files_found,
                 "ram_vault_entries": ram_vault_entries,
                 "active_lease": active_lease,
+                "retaindb_memories_found": retaindb_count,
+                "retaindb_status": retaindb_status,
                 "receipt_id": burn_receipt.get("receipt_id") if burn_receipt else None,
                 "burn_receipt": burn_receipt,
             }

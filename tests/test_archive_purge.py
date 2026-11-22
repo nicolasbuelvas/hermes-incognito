@@ -171,3 +171,62 @@ def test_register_wires_purge_into_burn_complete(isolated_hermes_env, monkeypatc
     assert result["pending_burn"] is False
     assert _SID in purged
     assert _SID in notified
+
+
+def test_endpoints_local_no_key_resolves(isolated_hermes_env, monkeypatch):
+    """A localhost store served without auth must resolve even with no RETAINDB_API_KEY."""
+    eng = IncognitoEngine(home_dir=isolated_hermes_env["home"])
+    values = {"RETAINDB_API_KEY": "", "RETAINDB_BASE_URL": "http://localhost:3111", "RETAINDB_PROJECT": "default"}
+    monkeypatch.setattr(engine_mod, "get_secret", lambda name, default="": values.get(name, default))
+    ep = eng._retaindb_endpoints()
+    assert ep is not None
+    assert ep == ("http://localhost:3111", "default", "")
+
+
+def test_endpoints_remote_no_key_skips(isolated_hermes_env, monkeypatch):
+    """A remote store still requires a key; no key → unconfigured (no behavior change for cloud)."""
+    eng = IncognitoEngine(home_dir=isolated_hermes_env["home"])
+    values = {"RETAINDB_API_KEY": "", "RETAINDB_BASE_URL": "https://api.retaindb.com", "RETAINDB_PROJECT": "proj"}
+    monkeypatch.setattr(engine_mod, "get_secret", lambda name, default="": values.get(name, default))
+    assert eng._retaindb_endpoints() is None
+
+
+def test_endpoints_local_from_config_no_secret_key(isolated_hermes_env, monkeypatch):
+    """No secrets at all, but config provides a loopback base_url → resolves. This is the real local-store path."""
+    eng = IncognitoEngine(home_dir=isolated_hermes_env["home"])
+    monkeypatch.setattr(engine_mod, "get_secret", lambda name, default="": "")
+    monkeypatch.setattr(engine_mod, "load_config_readonly",
+                        lambda: {"memory": {"retaindb": {"base_url": "http://127.0.0.1:3111", "project": "default"}}})
+    ep = eng._retaindb_endpoints()
+    assert ep is not None
+    assert ep == ("http://127.0.0.1:3111", "default", "")
+
+
+def test_is_local_retaindb_url():
+    assert engine_mod._is_local_retaindb_url("http://localhost:3111") is True
+    assert engine_mod._is_local_retaindb_url("http://127.0.0.1:3111/") is True
+    assert engine_mod._is_local_retaindb_url("http://[::1]:3111") is True
+    assert engine_mod._is_local_retaindb_url("https://api.retaindb.com") is False
+    assert engine_mod._is_local_retaindb_url("") is False
+
+
+def test_verify_zero_trace_reports_retaindb(isolated_hermes_env, monkeypatch):
+    """verify_zero_trace probes the archive store and folds surviving memories into the verdict."""
+    eng = IncognitoEngine(home_dir=isolated_hermes_env["home"])
+    monkeypatch.setattr(engine_mod, "get_secret", lambda name, default="": "")
+    monkeypatch.setattr(engine_mod, "load_config_readonly",
+                        lambda: {"memory": {"retaindb": {"base_url": "http://localhost:3111", "project": "default"}}})
+    sid = "sid-verify-ret-1"
+
+    monkeypatch.setattr(engine_mod.urllib.request, "urlopen",
+                        lambda *a, **k: _FakeResp(_listing_body(["m1", "m2"])))
+    res = eng.verify_zero_trace(sid)
+    assert res["retaindb_status"] == "ok"
+    assert res["retaindb_memories_found"] == 2
+    assert res["zero_trace"] is False  # surviving memories veto the verdict
+
+    monkeypatch.setattr(engine_mod.urllib.request, "urlopen",
+                        lambda *a, **k: _FakeResp(_listing_body([])))
+    res2 = eng.verify_zero_trace(sid)
+    assert res2["retaindb_memories_found"] == 0
+    assert res2["zero_trace"] is True  # a clean store does not veto
