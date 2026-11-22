@@ -29,6 +29,11 @@ try:
 except ImportError:
     import pii  # type: ignore[no-redef]
 
+try:
+    from . import lcm_purge
+except ImportError:
+    import lcm_purge  # type: ignore[no-redef]
+
 # Allowed Hermes public API imports with fallbacks for standalone/pytest environments
 try:
     from hermes_constants import get_hermes_home
@@ -1336,6 +1341,21 @@ class IncognitoEngine:
         except Exception as exc:
             logger.debug("Incognito archive purge failed (log-only, burn unaffected): %s", exc)
             return {"purged": purged, "error": str(exc)}
+
+    # ---------------------------------------------------------------------
+    # 13b. LCM store purge (Gate 3b)
+    # ---------------------------------------------------------------------
+
+    def purge_lcm_store(self, session_id: str) -> dict[str, Any]:
+        """Best-effort delete of *session_id*'s rows from the LCM store (lcm.db).
+
+        Called at burn time (log-only failure — a busy or missing lcm.db must never block
+        the local burn). Implemented in ``lcm_purge`` so the engine's raw-SQL-delete
+        forensics invariant (state.db rows are deleted only through SessionDB) holds by
+        construction: every DELETE in this plugin's burn path that bypasses SessionDB
+        lives in lcm_purge and targets lcm.db only.
+        """
+        return lcm_purge.purge_lcm_store(self.home_dir, session_id)
 
     # -------------------------------------------------------------------------
     # 14. sweep_expired
