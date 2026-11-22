@@ -73,13 +73,19 @@ def register(ctx: Any) -> None:
     """Entry point called by Hermes plugin loader to register capabilities."""
     engine = get_engine()
     emit_to_session = getattr(ctx, "emit_to_session", None)
-    if callable(emit_to_session):
-        def notify_burned(session_id: str) -> None:
+
+    def on_burn_complete(session_id: str) -> None:
+        # Gate 2: purge the external archive store (best-effort, log-only), then notify Desktop.
+        try:
+            engine.purge_memory_store(session_id)
+        except Exception:
+            logger.debug("Incognito archive purge raised (burn unaffected)")
+        if callable(emit_to_session):
             emit_to_session(session_id, "state.changed", {
                 "session_id": session_id, "active": False, "burned": True
             })
 
-        engine.on_burn_complete = notify_burned
+    engine.on_burn_complete = on_burn_complete
 
     # -------------------------------------------------------------------------
     # 1. Register Tools

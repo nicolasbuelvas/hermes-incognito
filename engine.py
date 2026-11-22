@@ -17,9 +17,12 @@ import stat
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 try:
     from . import pii
@@ -46,6 +49,12 @@ try:
 except ImportError:
     def load_config_readonly() -> dict[str, Any]:
         return {}
+
+try:
+    from agent.secret_scope import get_secret
+except ImportError:
+    def get_secret(name: str, default: str = "") -> str:
+        return default
 
 try:
     from plugins.plugin_storage import plugin_data_dir
@@ -1243,6 +1252,90 @@ class IncognitoEngine:
                 "receipt_id": receipt_id,
                 "timestamp": now_ts,
             }
+
+    # -------------------------------------------------------------------------
+    # 13b. Archive-store purge (RetainDB)
+    # -------------------------------------------------------------------------
+
+    _ARCHIVE_PURGE_DEADLINE_S = 15.0
+    _ARCHIVE_PAGE_LIMIT = 200
+
+    def _retaindb_endpoints(self) -> Optional[Tuple[str, str, str]]:
+        """Resolve (base_url, project, api_key) for the RetainDB memory store, or None if unconfigured.
+
+        Mirrors the RetainDB provider's resolution: scoped secrets first, then the
+        ``memory.retaindb`` config block, then the provider's profile fallback.
+        """
+        try:
+            api_key = get_secret("RETAINDB_API_KEY", "") or ""
+            base_url = re.sub(r"/+$", "", get_secret("RETAINDB_BASE_URL", "") or "")
+            project = get_secret("RETAINDB_PROJECT", "") or ""
+        except Exception:
+            api_key, base_url, project = "", "", ""
+        if not api_key:
+            return None
+        if not base_url or not project:
+            try:
+                block = (load_config_readonly() or {}).get("memory", {}).get("retaindb", {}) or {}
+                base_url = re.sub(r"/+$", "", str(block.get("base_url") or "") or base_url)
+                project = project or str(block.get("project") or "")
+            except Exception:
+                pass
+        base_url = re.sub(r"/+$", "", base_url or "https://api.retaindb.com")
+        if not project:
+            profile = os.path.basename(str(self.home_dir))
+            project = f"hermes-{profile}" if profile not in {"", ".hermes"} else "default"
+        return base_url, project, api_key
+
+    def purge_memory_store(self, session_id: str) -> dict[str, Any]:
+        """Best-effort delete of RetainDB memories recorded against *session_id*.
+
+        Called at burn time: the local zero-trace claim does not reach external archive
+        stores, and automatic session ingestion can outlive the session. Uses the SOTA
+        memory routes (``GET /v1/memory/session/{sid}`` + ``DELETE /v1/memory/{id}``):
+        the legacy ``GET /v1/memories?session_id=`` filter is not honored and the legacy
+        delete route is not registered on the deployed server. Log-only failure —
+        archive availability must never block or roll back the local burn.
+        """
+        if not session_id:
+            return {"skipped": "no session id"}
+        endpoints = self._retaindb_endpoints()
+        if endpoints is None:
+            return {"skipped": "retaindb not configured"}
+        base_url, project, api_key = endpoints
+        token = api_key.replace("Bearer ", "").strip()
+        headers = {"Authorization": f"Bearer {token}", "X-API-Key": token, "x-sdk-runtime": "hermes-incognito"}
+        deadline = time.monotonic() + self._ARCHIVE_PURGE_DEADLINE_S
+        purged = 0
+        try:
+            list_url = (f"{base_url}/v1/memory/session/{quote(session_id, safe='')}"
+                        f"?project={quote(project, safe='')}&include_pending=false")
+            with urllib.request.urlopen(urllib.request.Request(list_url, headers=headers), timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            items = payload.get("memories") if isinstance(payload, dict) else payload
+            for item in items or []:
+                if time.monotonic() > deadline:
+                    break
+                memory_id = item.get("id") if isinstance(item, dict) else None
+                # Overlay entries (ids like "pending:job:idx") are not deletable memory ids.
+                if not memory_id or str(memory_id).startswith("pending:"):
+                    continue
+                req = urllib.request.Request(f"{base_url}/v1/memory/{quote(str(memory_id), safe='')}",
+                                             method="DELETE", headers=headers)
+                try:
+                    urllib.request.urlopen(req, timeout=10)
+                    purged += 1
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        purged += 1  # already gone; treat as idempotent success
+                    else:
+                        raise
+            if purged:
+                logger.info("Incognito burn: purged %d archive-store memories for a burned session", purged)
+            return {"purged": purged}
+        except Exception as exc:
+            logger.debug("Incognito archive purge failed (log-only, burn unaffected): %s", exc)
+            return {"purged": purged, "error": str(exc)}
 
     # -------------------------------------------------------------------------
     # 14. sweep_expired
