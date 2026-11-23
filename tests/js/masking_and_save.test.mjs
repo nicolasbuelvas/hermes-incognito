@@ -2,7 +2,7 @@ import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
-import { setFocused, toasts } from './stubs/sdk.mjs'
+import { setFocused, toasts, logLines, host } from './stubs/sdk.mjs'
 import plugin, {
   MASK_BLOCKED,
   Vault,
@@ -18,6 +18,8 @@ import plugin, {
   performUndo,
   planSave,
   previewDraft,
+  purgeTranscriptTail,
+  requestBurn,
   requestSave,
   saveDialogCopy,
   scrambleFrame,
@@ -60,6 +62,8 @@ function fakeCtx(st, responses = {}) {
 
 beforeEach(() => {
   toasts.length = 0
+  logLines.length = 0
+  delete host.request
   setFocused('')
   globalThis.window = undefined
   _resetMaskingForTests()
@@ -197,6 +201,63 @@ test('a status error cancels the first send too', async () => {
     assert.equal(await handler({ text: SECRET_TEXT }), null)
     assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline)
   }
+})
+
+// --- tattler: when a send is blocked, the logs say exactly why ----------------------------------
+
+const tattleTexts = () => logLines.map(l => l.join(' '))
+
+test('tattler: a status failure that blocks a send is logged with the transport errors', async () => {
+  setFocused('s1')
+  host.request = async () => { throw new Error('Hermes gateway unavailable') }
+  const handler = makeMaskingMiddleware(fakeCtx(new Error('rest exploded')))
+  assert.equal(await handler({ text: SECRET_TEXT }), null)
+  assert.equal(toasts.at(-1).message, MASK_BLOCKED.offline, 'user-facing copy is unchanged')
+  const tattles = tattleTexts()
+  assert.ok(tattles.some(t => t.includes('rest exploded')), `rest error missing: ${tattles}`)
+  assert.ok(tattles.some(t => t.includes('Hermes gateway unavailable')), `rpc error missing: ${tattles}`)
+  assert.ok(tattles.some(t => t.includes('status')), `action missing: ${tattles}`)
+})
+
+test('tattler: a silent no-response is logged too (there is no exception to show)', async () => {
+  setFocused('s1')
+  const handler = makeMaskingMiddleware(fakeCtx(null))
+  assert.equal(await handler({ text: SECRET_TEXT }), null)
+  const tattles = tattleTexts()
+  assert.ok(
+    tattles.some(t => t.includes('status') && t.includes('returned nothing')),
+    tattles.join(' | ')
+  )
+})
+
+test('tattler: the RPC fallback answering is not logged as a failure', async () => {
+  setFocused('s1')
+  host.request = async name => (name === 'plugin.incognito.status' ? status({ redact: false }) : null)
+  const handler = makeMaskingMiddleware(fakeCtx(null))
+  const draft = { text: 'hello' }
+  assert.equal(await handler(draft), draft)
+  assert.equal(logLines.length, 0, tattleTexts().join(' | '))
+})
+
+test('tattler: a healthy status check logs nothing', async () => {
+  setFocused('s1')
+  const handler = makeMaskingMiddleware(fakeCtx(status({ redact: false })))
+  const draft = { text: 'hello' }
+  assert.equal(await handler(draft), draft)
+  assert.equal(logLines.length, 0, tattleTexts().join(' | '))
+})
+
+test('tattler: a masker error is logged, not just toasted', async () => {
+  setFocused('s1')
+  const handler = makeMaskingMiddleware(fakeCtx(status()))
+  const evil = {
+    get text() {
+      throw new Error('boom')
+    }
+  }
+  assert.equal(await handler(evil), null)
+  assert.equal(toasts.at(-1).message, MASK_BLOCKED.error)
+  assert.ok(tattleTexts().some(t => t.includes('boom')), tattleTexts().join(' | '))
 })
 
 test('the first draft uses the default mode and masking settings unless explicitly armed', async () => {
@@ -349,4 +410,107 @@ test('a saved chat reserves backend marker numbers and drops its vault when a bu
   current = { ok: true, burned: true }
   assert.equal(await send({ text: 'hello' }), null)
   assert.equal(vault.size, 0)
+})
+
+// --- transcript tail: a burned chat loses its Desktop display cache too -------------------------
+
+const TAIL_PREFIX = 'hermes.transcript-tail.v2:'
+const TAIL_INDEX = 'hermes.transcript-tail.v2-index'
+
+function fakeLocalStorage() {
+  const map = new Map()
+  return {
+    get length() { return map.size },
+    key: i => [...map.keys()][i] ?? null,
+    getItem: k => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => void map.set(k, String(v)),
+    removeItem: k => void map.delete(k)
+  }
+}
+
+function seedTail(storage, sid, body) {
+  const suffix = JSON.stringify(['local', 'default', sid])
+  storage.setItem(TAIL_PREFIX + suffix, `{"messages":[{"text":"${body}"}]}`)
+  const raw = storage.getItem(TAIL_INDEX)
+  const index = raw ? JSON.parse(raw) : []
+  index.push(suffix)
+  storage.setItem(TAIL_INDEX, JSON.stringify(index))
+}
+
+test('burned chat transcript-tail: the display cache entry is removed, other chats untouched', () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage }
+  seedTail(storage, 'burned-sid', 'secret one')
+  seedTail(storage, 'keeper-sid', 'secret two')
+  storage.setItem('unrelated', 'value')
+  assert.equal(purgeTranscriptTail('burned-sid'), 1)
+  assert.equal(storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 'burned-sid'])), null)
+  assert.equal(
+    storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 'keeper-sid'])),
+    '{"messages":[{"text":"secret two"}]}'
+  )
+  assert.deepEqual(JSON.parse(storage.getItem(TAIL_INDEX)), [JSON.stringify(['local', 'default', 'keeper-sid'])])
+  assert.equal(storage.getItem('unrelated'), 'value')
+})
+
+test('burned chat transcript-tail: an empty session id removes nothing', () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage }
+  seedTail(storage, 's1', 'x')
+  for (const sid of ['', null, undefined]) assert.equal(purgeTranscriptTail(sid), 0)
+  assert.equal(storage.length, 2, 'entry + index still present')
+})
+
+test('burned chat transcript-tail: works when localStorage is missing or hostile', () => {
+  globalThis.window = undefined
+  assert.equal(purgeTranscriptTail('s1'), 0)
+  globalThis.window = { localStorage: { length: 0, key() { throw new Error('denied') }, getItem() { throw new Error('denied') } } }
+  assert.equal(purgeTranscriptTail('s1'), 0)
+})
+
+test('burned chat transcript-tail: a corrupt index does not block the deletion', () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage }
+  storage.setItem(TAIL_INDEX, 'not-json')
+  storage.setItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 's1']), 'tail')
+  assert.equal(purgeTranscriptTail('s1'), 1)
+  assert.equal(storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 's1'])), null)
+})
+
+test('burned chat transcript-tail: unparseable entries are left untouched', () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage }
+  storage.setItem(TAIL_INDEX, JSON.stringify(['mystery', JSON.stringify(['local', 'default', 's1'])]))
+  storage.setItem(TAIL_PREFIX + 'not-a-json-suffix', 'tail')
+  assert.equal(purgeTranscriptTail('s1'), 0)
+  assert.equal(storage.getItem(TAIL_PREFIX + 'not-a-json-suffix'), 'tail')
+})
+
+test('burned chat transcript-tail: completing a burn purges the cache for that chat only', async () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage }
+  seedTail(storage, 'delete-me', 'secret one')
+  seedTail(storage, 'keeper-sid', 'secret two')
+  const ctx = fakeCtx(status())
+  const callbacks = new Map()
+  ctx.onEvent = (name, callback) => callbacks.set(name, callback)
+  plugin.register(ctx)
+  const onStateChanged = callbacks.get('plugin.incognito.state.changed')
+  assert.ok(onStateChanged, 'state.changed handler registered')
+  onStateChanged({ payload: { session_id: 'delete-me', burned: true, active: false } })
+  assert.equal(storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 'delete-me'])), null)
+  assert.equal(
+    storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 'keeper-sid'])),
+    '{"messages":[{"text":"secret two"}]}'
+  )
+})
+
+test('burned chat transcript-tail: a confirmed burn purges the cache right away', async () => {
+  const storage = fakeLocalStorage()
+  globalThis.window = { localStorage: storage, confirm: () => true }
+  seedTail(storage, 's1', 'secret one')
+  const ctx = fakeCtx(status())
+  await requestBurn(ctx, 's1')
+  assert.equal(storage.getItem(TAIL_PREFIX + JSON.stringify(['local', 'default', 's1'])), null)
+  assert.match(toasts.at(-1).message, /cleanup completed/)
 })
