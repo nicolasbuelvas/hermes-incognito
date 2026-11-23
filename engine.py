@@ -49,6 +49,99 @@ try:
 except ImportError:
     SessionDB = None  # type: ignore[assignment,misc]
 
+# ── Storage compatibility ──────────────────────────────────────────────────
+# Hermes >= 2026-11-23 (refactor(state)!: remove the old session store)
+# shrank hermes_state.SessionDB to a compatibility shim carrying only the
+# verbs listed in the plugin guide; everything else raises AttributeError.
+# The verbs this engine still needs map onto the storage interface:
+#   get_session_model_config_value    -> store.sessions.get_model_config_value
+#   patch_session_model_config        -> store.sessions.patch_model_config
+#   set_session_hidden                -> store.sessions.set_hidden
+#   session_ids_with_model_config_key -> store.sessions.session_ids_with_model_config_key
+#   get_session_delete_targets        -> store.sessions.delete_targets
+# Handles that already carry those verbs (older cores, core-free test mocks)
+# are used as-is; only the reduced shim gets wrapped.
+_LEGACY_DB_VERBS = (
+    "get_session_model_config_value",
+    "patch_session_model_config",
+    "set_session_hidden",
+    "session_ids_with_model_config_key",
+    "get_session_delete_targets",
+)
+
+
+class _CompatSessionDB:
+    """Legacy SessionDB verb surface over the modern storage interface.
+
+    Guide verbs (get_session, delete_session, ...) delegate to the shim
+    handle; the dropped verbs go through persistence_assembly.open_persistence
+    on the same state.db file. The store handle opens lazily on first dropped-verb
+    use and releases at close(), mirroring the old single-connection lifecycle.
+    """
+
+    def __init__(self, base: Any, db_path: Path) -> None:
+        self._base = base
+        self._db_path = Path(db_path)
+        self._stack = None  # type: ignore[assignment]
+
+    # Store handle is kept as (stack, store) pair to avoid re-entry surprises.
+    def _store(self) -> Any:
+        if self._stack is None:
+            from contextlib import ExitStack
+            from persistence_assembly import open_persistence, profile_scope
+
+            stack = ExitStack()
+            store = stack.enter_context(
+                open_persistence(profile_scope(home=self._db_path.parent), eager=True)
+            )
+            self._stack = (stack, store)
+        return self._stack[1]
+
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
+        return self._store().sessions.get_model_config_value(session_id, key, default)
+
+    def patch_session_model_config(self, session_id: str, patch: dict[str, Any]) -> None:
+        self._store().sessions.patch_model_config(session_id, patch)
+
+    def set_session_hidden(self, session_id: str, hidden: bool) -> Any:
+        return self._store().sessions.set_hidden(session_id, bool(hidden))
+
+    def session_ids_with_model_config_key(self, key: str) -> list[str]:
+        return list(self._store().sessions.session_ids_with_model_config_key(key))
+
+    def get_session_delete_targets(self, session_id: str) -> list[str]:
+        return list(self._store().sessions.delete_targets(session_id))
+
+    def close(self) -> None:
+        if self._stack is not None:
+            stack, _ = self._stack
+            self._stack = None
+            stack.close()
+        self._base.close()
+
+    def __enter__(self) -> "_CompatSessionDB":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def _open_session_db(db_path: Path) -> Any:
+    """Open the state store with the full legacy verb surface this engine uses.
+
+    Passes the handle through unchanged when it already carries the legacy
+    verbs; wraps the reduced compatibility shim with :class:`_CompatSessionDB`.
+    """
+    if SessionDB is None:
+        raise RuntimeError("SessionDB is unavailable; cannot open the state store")
+    handle = SessionDB(db_path=Path(db_path))
+    if all(hasattr(handle, verb) for verb in _LEGACY_DB_VERBS):
+        return handle
+    return _CompatSessionDB(handle, db_path)
+
 try:
     from hermes_cli.config import load_config_readonly
 except ImportError:
@@ -653,7 +746,7 @@ class IncognitoEngine:
 
         previous = {}
         try:
-            db = SessionDB(db_path=state_db)
+            db = _open_session_db(state_db)
             try:
                 for sid in markers:
                     row = db.get_session(sid)
@@ -785,7 +878,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         for sid in db.session_ids_with_model_config_key("incognito"):
                             if isinstance(sid, str) and sid:
@@ -848,7 +941,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db.set_session_hidden(session_id, True)
                         db.patch_session_model_config(session_id, {"incognito": lease})
@@ -942,7 +1035,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db.set_session_hidden(new_session_id, True)
                         db.patch_session_model_config(new_session_id, {"incognito": new_lease})
@@ -1208,7 +1301,7 @@ class IncognitoEngine:
             db = None
             try:
                 if SessionDB is not None and state_db.exists():
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
             except Exception as exc:
                 logger.debug("Cannot open SessionDB for incognito burn: %s", exc)
 
@@ -1580,7 +1673,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db_incognito_ids = db.session_ids_with_model_config_key("incognito")
                         saved_members = {
@@ -2078,7 +2171,7 @@ class IncognitoEngine:
                 state_db = self.home_dir / "state.db"
                 if SessionDB is None or not state_db.exists():
                     return False
-                db = SessionDB(db_path=state_db)
+                db = _open_session_db(state_db)
                 try:
                     marker = db.get_session_model_config_value(session_id, "incognito")
                 finally:

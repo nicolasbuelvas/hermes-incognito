@@ -76,12 +76,18 @@ def real_engine(tmp_path, monkeypatch):
     A fresh module is required because the engine binds hermes_state's
     SessionDB at import time; the rest of the suite imports the engine
     core-free and would otherwise keep the stale binding.
+
+    The sibling suite also leaks the plugin's flat tools.py into
+    sys.modules["tools"] (plugin __init__ fallback during collection);
+    save and evict it so the core's deferred ``from tools...`` imports
+    resolve to the core package, then restore it afterwards.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.syspath_prepend(CORE_PATH)
+    evicted = {}
     for name in list(sys.modules):
-        if _is_core_module(name):
-            del sys.modules[name]
+        if _is_core_module(name) or name == "tools":
+            evicted[name] = sys.modules.pop(name)
     spec = importlib.util.spec_from_file_location(
         "incognito_engine_real_core", PROJECT_ROOT / "engine.py"
     )
@@ -92,6 +98,7 @@ def real_engine(tmp_path, monkeypatch):
     for name in list(sys.modules):
         if _is_core_module(name) or name == spec.name:
             del sys.modules[name]
+    sys.modules.update(evicted)
 
 
 def _make_session(home: Path, session_id: str, source: str = "cli") -> str:
@@ -127,10 +134,10 @@ def test_masking_active_reads_redact_marker(real_engine, tmp_path):
     sid = _make_session(tmp_path, "local-marked-sid")
     eng = real_engine.IncognitoEngine(home_dir=tmp_path)
     db_path = tmp_path / "state.db"
-    with real_engine.SessionDB(db_path=db_path) as db:
+    with real_engine._open_session_db(db_path) as db:
         db.patch_session_model_config(sid, {"incognito": {"mode": "standard", "redact_pii": True}})
     assert eng.masking_active(sid) is True
-    with real_engine.SessionDB(db_path=db_path) as db:
+    with real_engine._open_session_db(db_path) as db:
         db.patch_session_model_config(sid, {"incognito": {"mode": "standard", "redact_pii": False}})
     assert eng.masking_active(sid) is False
 
@@ -169,7 +176,7 @@ def test_burn_verbs_and_delete_cascade(real_engine, tmp_path):
     eng = real_engine.IncognitoEngine(home_dir=tmp_path)
     db_path = tmp_path / "state.db"
 
-    db = real_engine.SessionDB(db_path=db_path)
+    db = real_engine._open_session_db(db_path)
     try:
         db.patch_session_model_config(parent, {"incognito": {"mode": "strict", "redact_pii": True}})
         found = db.session_ids_with_model_config_key("incognito")
