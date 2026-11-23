@@ -172,6 +172,20 @@ def _flat_hook_files(directory: Path, session_id: str) -> Iterator[Path]:
                 yield path
 
 
+# Store-relative reference to a committed native-input media file: the content-addressed
+# ``<sha256>/<name>`` path under ``<home>/cache/documents/native-inputs``. The reference is
+# embedded in message content as ``[Image attached at: ...native-inputs/<sha256>/<name>]``; the
+# image bytes themselves live at that store path and are NOT removed by the transcript scrub.
+_MEDIA_REF = re.compile(r"native-inputs[\\/]+([0-9a-fA-F]{64})[\\/]+([^\s\"'\]]+)")
+
+
+def _extract_media_refs(text: str) -> set[tuple[str, str]]:
+    """Return the ``(sha256, name)`` native-input store refs embedded in ``text`` (empty if none)."""
+    if not text or "native-inputs" not in text:
+        return set()
+    return {(m.group(1).lower(), m.group(2)) for m in _MEDIA_REF.finditer(text)}
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive without using os.kill(pid, 0) on Windows."""
     if pid <= 0:
@@ -970,6 +984,65 @@ class IncognitoEngine:
             logger.debug("Cannot verify incognito database cleanup: %s", exc)
             return None
 
+    def _extract_media_store_refs(self, state_db: Path, target_ids: set[str]) -> dict[str, list[str]]:
+        """Map each target session to the native-input store refs (``<sha256>/<name>``) its
+        messages reference. Read-only.
+
+        Captured BEFORE ``delete_session`` removes the message rows, and persisted in the burn
+        lease, so a deferred retry can still scrub the media bytes after the rows are gone.
+        """
+        refs: dict[str, list[str]] = {}
+        if not state_db.exists() or not target_ids:
+            return refs
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            logger.debug("Cannot open state.db for media-ref extraction: %s", exc)
+            return refs
+        try:
+            for sid in sorted(target_ids):
+                try:
+                    rows = conn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? "
+                        "AND content LIKE '%native-inputs%'",
+                        (sid,),
+                    ).fetchall()
+                except sqlite3.Error as exc:
+                    logger.debug("Cannot read media refs for %s: %s", sid, exc)
+                    continue
+                found: set[tuple[str, str]] = set()
+                for (content,) in rows:
+                    found |= _extract_media_refs(content)
+                if found:
+                    refs[sid] = sorted(f"{sha}/{name}" for sha, name in found)
+        finally:
+            conn.close()
+        return refs
+
+    def _media_ref_shared(self, state_db: Path, sha256: str) -> bool:
+        """True if any message row still references this content hash.
+
+        Called after ``delete_session``, so a positive count means a DIFFERENT (non-burning)
+        session still owns these bytes; the ref is kept, not deleted, so that reference stays
+        valid. A deferred delete (rows still present) counts too, which is conservatively safe:
+        the burn retries and re-checks once the rows are gone.
+        """
+        if not state_db.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+            try:
+                count = conn.execute(
+                    "SELECT count(DISTINCT session_id) FROM messages WHERE content LIKE ?",
+                    (f"%{sha256}%",),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            return count > 0
+        except sqlite3.Error as exc:
+            logger.debug("Cannot check media-ref sharing for %s: %s", sha256[:12], exc)
+            return False
+
     def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
         """Retry burning a busy session once its active Gateway turn admission settles."""
         delays = {1: 1.5, 2: 5.0, 3: 15.0}
@@ -994,11 +1067,21 @@ class IncognitoEngine:
         timer.daemon = True
         timer.start()
 
-    def _scrub_burn_files(self, target_ids: set[str]) -> tuple[int, bool]:
-        """Scrub authorized artifacts and report whether any cleanup must be retried."""
+    def _scrub_burn_files(
+        self, target_ids: set[str], media_refs: dict[str, list[str]] | None = None
+    ) -> tuple[int, bool, list[str]]:
+        """Scrub authorized artifacts and report whether any cleanup must be retried.
+
+        Returns ``(files_scrubbed, files_pending, media_purged)`` where ``media_purged`` lists the
+        store-relative native-input refs confirmed removed (for the zero-trace receipt).
+        """
         zero_fill = self.get_settings().get("zero_fill_files", True)
         files_scrubbed = 0
         files_pending = False
+        media_purged: list[str] = []
+        media_refs = media_refs or {}
+        native_root = self.home_dir / "cache" / "documents" / "native-inputs"
+        state_db = self.home_dir / "state.db"
 
         def _failed(exc: OSError | RuntimeError) -> None:
             nonlocal files_pending
@@ -1030,6 +1113,49 @@ class IncognitoEngine:
             except (OSError, RuntimeError) as exc:
                 _failed(exc)
 
+        def _scrub_media_ref(ref: str) -> None:
+            """Zero-fill + unlink one store-relative native-input ref. A ref still referenced by
+            another (non-burning) session is kept, not deleted, so that reference stays valid."""
+            nonlocal media_purged, files_pending
+            sha, sep, name = ref.partition("/")
+            if not sep or len(sha) != 64 or not name or "/" in name or "\\" in name:
+                return
+            if self._media_ref_shared(state_db, sha):
+                return  # shared: another session still owns these bytes
+            target = native_root / sha / name
+            try:
+                if target.resolve().parts != target.parts:
+                    files_pending = True
+                    return
+                try:
+                    info = target.lstat()
+                except FileNotFoundError:
+                    media_purged.append(ref)  # already gone: not on disk
+                    return
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    files_pending = True
+                    return
+                if zero_fill and info.st_size > 0:
+                    with target.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                target.unlink()
+            except (OSError, RuntimeError) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    files_pending = True
+                    logger.debug("Incognito media cleanup deferred: %s", exc)
+                    return
+            media_purged.append(ref)
+            try:
+                (native_root / sha).rmdir()  # drop the empty content-hash dir if nothing else
+            except OSError:
+                pass
+
         try:
             sessions_dir = (self.home_dir / "sessions").resolve()
             hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
@@ -1038,6 +1164,8 @@ class IncognitoEngine:
                     _scrub_file(path)
                 for path in _flat_hook_files(hook_outputs_dir, sid):
                     _scrub_file(path)
+                for ref in media_refs.get(sid, []):
+                    _scrub_media_ref(ref)
 
                 sid_dir = _hook_session_dir(hook_outputs_dir, sid)
                 if sid_dir is None:
@@ -1063,7 +1191,7 @@ class IncognitoEngine:
                         _failed(exc)
         except (OSError, RuntimeError) as exc:
             _failed(exc)
-        return files_scrubbed, files_pending
+        return files_scrubbed, files_pending, media_purged
 
     def burn_session(
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
@@ -1159,6 +1287,16 @@ class IncognitoEngine:
 
                 # Persist recovery before deleting a row that may hold the only incognito marker.
                 lineage = sorted(target_ids)
+                # Capture the native-input media refs the messages reference BEFORE delete_session
+                # removes the rows; merge with any refs a prior (pending) attempt already recorded,
+                # so a deferred retry can still scrub the bytes after the rows are gone.
+                media_by_sid = self._extract_media_store_refs(state_db, set(lineage))
+                for sid in lineage:
+                    prior = leases.get(sid)
+                    if isinstance(prior, dict):
+                        for ref in prior.get("media_refs", []) or []:
+                            if ref not in media_by_sid.get(sid, []):
+                                media_by_sid.setdefault(sid, []).append(ref)
                 for sid in lineage:
                     leases[sid] = {
                         **authorized_leases[sid],
@@ -1166,6 +1304,7 @@ class IncognitoEngine:
                         "pending_burn": True,
                         "expires_at": 0,
                         "lineage_ids": lineage,
+                        "media_refs": media_by_sid.get(sid, []),
                     }
                 self._write_leases(leases)
 
@@ -1189,7 +1328,9 @@ class IncognitoEngine:
             db_deleted = rows_after == 0 and (
                 db_deleted or bool(rows_before) or bool(authorized_leases[session_id].get("db_deleted"))
             )
-            files_scrubbed, files_pending = self._scrub_burn_files(target_ids)
+            files_scrubbed, files_pending, media_purged = self._scrub_burn_files(
+                target_ids, media_by_sid
+            )
             pending_burn = rows_after != 0 or files_pending
 
             vault_keys_cleared = 0
@@ -1231,6 +1372,8 @@ class IncognitoEngine:
                 "pending_burn": pending_burn,
                 "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
+                "media_files_purged": len(media_purged),
+                "media_purged": media_purged,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
@@ -1262,6 +1405,7 @@ class IncognitoEngine:
                 "pending_burn": pending_burn,
                 "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
+                "media_files_purged": len(media_purged),
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
                 "timestamp": now_ts,
@@ -1536,6 +1680,18 @@ class IncognitoEngine:
                     burn_receipt = rec
                     break
 
+            # Native-input media: the burn receipt records the store-relative refs it confirmed
+            # removed. Any still on disk is a residual trace (the transcript scrub alone leaves it).
+            media_files_found = 0
+            if burn_receipt:
+                native_root = self.home_dir / "cache" / "documents" / "native-inputs"
+                for ref in burn_receipt.get("media_purged", []) or []:
+                    sha, sep, name = str(ref).partition("/")
+                    if not sep or not sha or not name or "/" in name or "\\" in name:
+                        continue
+                    if (native_root / sha / name).exists():
+                        media_files_found += 1
+
             zero_trace = (
                 db_rows_found == 0
                 and session_files_found == 0
@@ -1543,6 +1699,7 @@ class IncognitoEngine:
                 and ram_vault_entries == 0
                 and not active_lease
                 and retaindb_clean
+                and media_files_found == 0
             )
 
             return {
@@ -1553,6 +1710,7 @@ class IncognitoEngine:
                 "session_files_found": session_files_found,
                 "hook_files_found": hook_files_found,
                 "ram_vault_entries": ram_vault_entries,
+                "media_files_found": media_files_found,
                 "active_lease": active_lease,
                 "retaindb_memories_found": retaindb_count,
                 "retaindb_status": retaindb_status,
