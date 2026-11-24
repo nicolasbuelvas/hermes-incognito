@@ -145,7 +145,12 @@ def register(ctx: Any) -> None:
         except IncognitoActivationError as exc:
             return {"action": "block", "message": f"Could not activate Incognito. {exc}"}
         except Exception as exc:
-            logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
+            logger.warning(
+                "Incognito could not mask this turn (%s: %s); blocking it.",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}
         if engine.is_incognito(sid):
             engine.touch_session(sid)

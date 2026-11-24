@@ -13,8 +13,10 @@ caller can refuse to send anything that still looks personal.
 from __future__ import annotations
 
 import copy
+import hashlib
 import ipaddress
 import json
+import logging
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -38,6 +40,18 @@ KINDS = (
 
 PLACEHOLDER_RE = re.compile(r"\[(SECRET|PASSWORD|EMAIL|IBAN|CARD|NIT|ID|SSN|IP|PHONE|ADDRESS)_(\d+)\]")
 _NOT_PLACEHOLDER = r"(?!\[(?:SECRET|PASSWORD|EMAIL|IBAN|CARD|NIT|ID|SSN|IP|PHONE|ADDRESS)_\d+\])"
+
+# Diagnostics for verify failures. The vault itself never reaches the logs: only lengths,
+# digests, and previews with the matched value blacked out.
+logger = logging.getLogger("hermes_plugins.incognito.pii")
+
+
+def _redact_for_log(text: str, value: str) -> str:
+    """Black out every case-insensitive occurrence of ``value`` for a log preview."""
+    red = "▮" * min(len(value), 12)
+    out = text.replace(value, red)
+    out = re.sub(re.escape(value), red, out, flags=re.IGNORECASE)
+    return out
 
 WITHHELD_TEXT = "[content withheld: Incognito masking is on and can't check images, audio, or files]"
 
@@ -496,8 +510,21 @@ def verify_payload(payload: Any, vault: Vault) -> list[str]:
     if originals:
         for text in iter_strings(payload):
             lowered = text.lower()
-            if any(o in text or o.lower() in lowered for o in originals):
-                problems.append("a masked value reappeared")
+            for o in originals:
+                if o in text or o.lower() in lowered:
+                    problems.append("a masked value reappeared")
+                    # Name the culprit without logging it: size, digest, and the context
+                    # around the hit with the value blacked out.
+                    logger.warning(
+                        "Incognito verify: masked value reappeared (value len=%d, digest=%s) "
+                        "in a %d-char payload string: %.160s",
+                        len(o),
+                        hashlib.sha256(o.encode("utf-8", "replace")).hexdigest()[:12],
+                        len(text),
+                        _redact_for_log(text, o),
+                    )
+                    break
+            if "a masked value reappeared" in problems:
                 break
     return sorted(set(problems))
 

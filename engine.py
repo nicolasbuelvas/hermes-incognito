@@ -792,7 +792,7 @@ class IncognitoEngine:
             finally:
                 db.close()
         except Exception as exc:
-            logger.warning("Could not update Incognito chat history (%s)", type(exc).__name__)
+            logger.warning("Could not update Incognito chat history (%s: %s)", type(exc).__name__, exc, exc_info=True)
             return False
         return True
 
