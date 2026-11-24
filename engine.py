@@ -279,6 +279,59 @@ def _extract_media_refs(text: str) -> set[tuple[str, str]]:
     return {(m.group(1).lower(), m.group(2)) for m in _MEDIA_REF.finditer(text)}
 
 
+# Desktop composer attachment caches, keyed by directory name only: the renderer writes
+# images under <userData>/composer-images and text pastes under <HERMES_HOME>/composer-pastes
+# (with a legacy <userData>/composer-pastes). Filenames carry no session id; the absolute
+# path in messages.content is the only mapping, so burn captures those paths.
+COMPOSER_CACHE_DIRS = ("composer-images", "composer-pastes")
+
+# Absolute path into a composer cache dir, as embedded in message content. Plain,
+# backtick-quoted (@image:`...` / @file:`...`), or file:// URI form. Intermediate dir
+# components may contain spaces (user profiles, "Application Support"); the generator
+# sanitizes filenames so the final component never does.
+_COMPOSER_FILE_REF_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/)"                      # drive letter or POSIX root
+    # intermediate dirs; spaces allowed ("Application Support", "John Doe") but a
+    # component must end in a non-space before its separator, so the match cannot
+    # stride across prose between two paths ("x.txt and /home/u/...").
+    r"(?:[^\\/:*?\"<>|`'\",;()\[\]{}=]*[^\\/:*?\"<>|`'\",;()\[\]{}=\s][\\/])*"
+    r"(?:composer-images|composer-pastes)[/\\]"  # the cache dir
+    r"([^\\/:*?\"<>|`'\",;()\[\]{}=\s]+)"       # filename
+)
+
+
+def _under_composer_root(path: Path, root: Path) -> bool:
+    parts, root_parts = [p.casefold() for p in path.parts], [p.casefold() for p in root.parts]
+    return len(parts) > len(root_parts) and parts[: len(root_parts)] == root_parts
+
+
+def _composer_file_refs_in_text(text: str, roots: list[Path]) -> set[str]:
+    """Absolute paths into a known composer cache root referenced by ``text`` (empty if none)."""
+    if not text or not ("composer-images" in text or "composer-pastes" in text):
+        return set()
+    found: set[str] = set()
+    for match in _COMPOSER_FILE_REF_RE.finditer(text):
+        candidate = match.group(0)
+        if candidate.lower().startswith("file://"):
+            candidate = candidate[7:]
+            if candidate.startswith("/"):  # file:///C:/... -> C:/...
+                candidate = candidate[1:]
+        # A match may start at the slash left before a drive letter (file:///C:/...):
+        # /C:/x is drive-relative — normalize to the absolute drive form.
+        if candidate.startswith("/") and len(candidate) > 3 and candidate[1] == ":" and candidate[2] in "/\\":
+            candidate = candidate[1:]
+        candidate = urllib.parse.unquote(candidate)
+        path = Path(candidate)
+        if not path.name or path.name in (".", "..") or ".." in path.parts:
+            continue
+        if path.parent.name not in COMPOSER_CACHE_DIRS:
+            continue
+        if not any(_under_composer_root(path, root) for root in roots):
+            continue  # same cache dir name outside a known root: not ours to touch
+        found.add(str(path))
+    return found
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive without using os.kill(pid, 0) on Windows."""
     if pid <= 0:
@@ -1136,6 +1189,91 @@ class IncognitoEngine:
             logger.debug("Cannot check media-ref sharing for %s: %s", sha256[:12], exc)
             return False
 
+    def _composer_cache_roots(self) -> list[Path]:
+        """Desktop composer attachment cache roots on this host.
+
+        ``<HERMES_HOME>/composer-pastes`` (current app: text pastes) plus the Electron
+        userData dir (``<APPDATA>/Hermes`` on Windows, ``$XDG_CONFIG_HOME/Hermes``
+        elsewhere), which holds ``composer-images`` and legacy ``composer-pastes``.
+        """
+        roots = [self.home_dir]
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                roots.append(Path(appdata) / "Hermes")
+        else:
+            config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+            roots.append(Path(config) / "Hermes")
+        return roots
+
+    def _extract_composer_file_refs(self, state_db: Path, target_ids: set[str]) -> dict[str, list[str]]:
+        """Map each target session to the composer-cache file paths its messages reference.
+
+        Read-only. Captured BEFORE ``delete_session`` removes the message rows and persisted
+        in the burn lease (mirrors :meth:`_extract_media_store_refs`), so a deferred retry can
+        still scrub the bytes after the rows are gone.
+        """
+        refs: dict[str, list[str]] = {}
+        if not state_db.exists() or not target_ids:
+            return refs
+        roots = self._composer_cache_roots()
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            logger.debug("Cannot open state.db for composer-ref extraction: %s", exc)
+            return refs
+        try:
+            for sid in sorted(target_ids):
+                try:
+                    rows = conn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? "
+                        "AND (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%')",
+                        (sid,),
+                    ).fetchall()
+                except sqlite3.Error as exc:
+                    logger.debug("Cannot read composer refs for %s: %s", sid, exc)
+                    continue
+                found: set[str] = set()
+                for (content,) in rows:
+                    found |= _composer_file_refs_in_text(content, roots)
+                if found:
+                    refs[sid] = sorted(found)
+        finally:
+            conn.close()
+        return refs
+
+    def _composer_file_shared(self, state_db: Path, file_path: str, target_ids: set[str]) -> bool:
+        """True if any message row OUTSIDE the burning set still references this file.
+
+        Uses the same normalizing extractor as the capture step, so separator, quoting,
+        URI, and percent-encoding variants all compare equal. Rows of the burning sessions
+        themselves don't count: they go away with the burn (a deferred delete re-checks on
+        retry). On a read failure the file is KEPT — a live reference would dangle if we
+        deleted it, and the retry re-checks once the store is readable.
+        """
+        if not state_db.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT session_id, content FROM messages "
+                    "WHERE (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%')"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.debug("Cannot check composer-file sharing for %s: %s", file_path, exc)
+            return True
+        roots = self._composer_cache_roots()
+        target = str(Path(file_path))
+        for sid, content in rows:
+            if sid in target_ids:
+                continue
+            if target in _composer_file_refs_in_text(content, roots):
+                return True
+        return False
+
     def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
         """Retry burning a busy session once its active Gateway turn admission settles."""
         delays = {1: 1.5, 2: 5.0, 3: 15.0}
@@ -1161,18 +1299,25 @@ class IncognitoEngine:
         timer.start()
 
     def _scrub_burn_files(
-        self, target_ids: set[str], media_refs: dict[str, list[str]] | None = None
-    ) -> tuple[int, bool, list[str]]:
+        self,
+        target_ids: set[str],
+        media_refs: dict[str, list[str]] | None = None,
+        composer_files: dict[str, list[str]] | None = None,
+    ) -> tuple[int, bool, list[str], list[str]]:
         """Scrub authorized artifacts and report whether any cleanup must be retried.
 
-        Returns ``(files_scrubbed, files_pending, media_purged)`` where ``media_purged`` lists the
-        store-relative native-input refs confirmed removed (for the zero-trace receipt).
+        Returns ``(files_scrubbed, files_pending, media_purged, composer_purged)`` where
+        ``media_purged`` lists the store-relative native-input refs confirmed removed and
+        ``composer_purged`` lists the composer-cache file paths confirmed removed (for the
+        zero-trace receipt).
         """
         zero_fill = self.get_settings().get("zero_fill_files", True)
         files_scrubbed = 0
         files_pending = False
         media_purged: list[str] = []
+        composer_purged: list[str] = []
         media_refs = media_refs or {}
+        composer_files = composer_files or {}
         native_root = self.home_dir / "cache" / "documents" / "native-inputs"
         state_db = self.home_dir / "state.db"
 
@@ -1249,6 +1394,48 @@ class IncognitoEngine:
             except OSError:
                 pass
 
+        def _scrub_composer_file(file_path: str) -> None:
+            """Zero-fill + unlink one composer-cache file. A file still referenced by another
+            (non-burning) session is kept, not deleted, so that reference stays valid."""
+            nonlocal composer_purged, files_pending
+            path = Path(file_path)
+            if not path.name or path.name in (".", "..") or ".." in path.parts:
+                return  # stale/foreign ref: nothing to do
+            if path.parent.name not in COMPOSER_CACHE_DIRS:
+                return
+            if not any(_under_composer_root(path, root) for root in self._composer_cache_roots()):
+                return  # root moved since the ref was captured: don't touch an unknown tree
+            if self._composer_file_shared(state_db, file_path, target_ids):
+                return
+            try:
+                if path.resolve().parts != path.parts:
+                    files_pending = True
+                    return
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    composer_purged.append(file_path)  # already gone: not on disk
+                    return
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    files_pending = True
+                    return
+                if zero_fill and info.st_size > 0:
+                    with path.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                path.unlink()
+            except (OSError, RuntimeError) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    files_pending = True
+                    logger.debug("Incognito composer-file cleanup deferred: %s", exc)
+                    return
+            composer_purged.append(file_path)
+
         try:
             sessions_dir = (self.home_dir / "sessions").resolve()
             hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
@@ -1259,6 +1446,8 @@ class IncognitoEngine:
                     _scrub_file(path)
                 for ref in media_refs.get(sid, []):
                     _scrub_media_ref(ref)
+                for file_path in composer_files.get(sid, []):
+                    _scrub_composer_file(file_path)
 
                 sid_dir = _hook_session_dir(hook_outputs_dir, sid)
                 if sid_dir is None:
@@ -1284,7 +1473,7 @@ class IncognitoEngine:
                         _failed(exc)
         except (OSError, RuntimeError) as exc:
             _failed(exc)
-        return files_scrubbed, files_pending, media_purged
+        return files_scrubbed, files_pending, media_purged, composer_purged
 
     def burn_session(
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
@@ -1384,12 +1573,16 @@ class IncognitoEngine:
                 # removes the rows; merge with any refs a prior (pending) attempt already recorded,
                 # so a deferred retry can still scrub the bytes after the rows are gone.
                 media_by_sid = self._extract_media_store_refs(state_db, set(lineage))
+                composer_by_sid = self._extract_composer_file_refs(state_db, set(lineage))
                 for sid in lineage:
                     prior = leases.get(sid)
                     if isinstance(prior, dict):
                         for ref in prior.get("media_refs", []) or []:
                             if ref not in media_by_sid.get(sid, []):
                                 media_by_sid.setdefault(sid, []).append(ref)
+                        for file_path in prior.get("composer_files", []) or []:
+                            if file_path not in composer_by_sid.get(sid, []):
+                                composer_by_sid.setdefault(sid, []).append(file_path)
                 for sid in lineage:
                     leases[sid] = {
                         **authorized_leases[sid],
@@ -1398,6 +1591,7 @@ class IncognitoEngine:
                         "expires_at": 0,
                         "lineage_ids": lineage,
                         "media_refs": media_by_sid.get(sid, []),
+                        "composer_files": composer_by_sid.get(sid, []),
                     }
                 self._write_leases(leases)
 
@@ -1421,8 +1615,8 @@ class IncognitoEngine:
             db_deleted = rows_after == 0 and (
                 db_deleted or bool(rows_before) or bool(authorized_leases[session_id].get("db_deleted"))
             )
-            files_scrubbed, files_pending, media_purged = self._scrub_burn_files(
-                target_ids, media_by_sid
+            files_scrubbed, files_pending, media_purged, composer_purged = self._scrub_burn_files(
+                target_ids, media_by_sid, composer_by_sid
             )
             pending_burn = rows_after != 0 or files_pending
 
@@ -1467,6 +1661,8 @@ class IncognitoEngine:
                 "files_scrubbed": files_scrubbed,
                 "media_files_purged": len(media_purged),
                 "media_purged": media_purged,
+                "composer_files_purged": len(composer_purged),
+                "composer_purged": composer_purged,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
@@ -1499,6 +1695,8 @@ class IncognitoEngine:
                 "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
                 "media_files_purged": len(media_purged),
+                "composer_files_purged": len(composer_purged),
+                "composer_purged": composer_purged,
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
                 "timestamp": now_ts,
@@ -1785,6 +1983,18 @@ class IncognitoEngine:
                     if (native_root / sha / name).exists():
                         media_files_found += 1
 
+            # Composer-cache attachments: the receipt records the file paths it confirmed
+            # removed. Any still on disk is a residual trace (the transcript scrub alone
+            # leaves the renderer's composer caches untouched).
+            composer_files_found = 0
+            if burn_receipt:
+                for file_path in burn_receipt.get("composer_purged", []) or []:
+                    try:
+                        if Path(str(file_path)).exists():
+                            composer_files_found += 1
+                    except OSError:
+                        composer_files_found += 1
+
             zero_trace = (
                 db_rows_found == 0
                 and session_files_found == 0
@@ -1793,6 +2003,7 @@ class IncognitoEngine:
                 and not active_lease
                 and retaindb_clean
                 and media_files_found == 0
+                and composer_files_found == 0
             )
 
             return {
@@ -1804,6 +2015,7 @@ class IncognitoEngine:
                 "hook_files_found": hook_files_found,
                 "ram_vault_entries": ram_vault_entries,
                 "media_files_found": media_files_found,
+                "composer_files_found": composer_files_found,
                 "active_lease": active_lease,
                 "retaindb_memories_found": retaindb_count,
                 "retaindb_status": retaindb_status,

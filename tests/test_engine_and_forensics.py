@@ -527,7 +527,7 @@ def test_burn_recovers_after_interruption_with_database_only_marker(isolated_her
         conn.execute("INSERT INTO sessions (id, model_config) VALUES (?, ?)", (sid, '{"incognito": {"mode": "strict"}}'))
         conn.execute("INSERT INTO sessions (id) VALUES (?)", ("public",))
 
-    def interrupt_before_file_cleanup(_target_ids, _media_refs=None):
+    def interrupt_before_file_cleanup(_target_ids, _media_refs=None, _composer_files=None):
         raise SystemExit
 
     assert not eng.is_incognito(sid)
