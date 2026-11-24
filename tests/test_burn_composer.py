@@ -6,6 +6,10 @@ The Desktop keeps two app-managed attachment caches outside the transcript:
 - ``<HERMES_HOME>/composer-pastes/<name>.txt`` (plus legacy ``<userData>/composer-pastes``)
   — large plain-text pastes attached as chips.
 
+``file.attach`` then stages a copy of the attached file under
+``<HERMES_HOME>/attachments/`` and the saved message references THAT copy, orphaning
+the composer original — burn must capture and purge both (same basename, same bytes).
+
 Filenames carry no session id; the only mapping is the absolute path embedded in
 ``messages.content`` (``@image:`...``` / ``@file:`` attachments). Burn must capture those
 paths before ``delete_session`` (same lease/retry pattern as the native-input media
@@ -81,6 +85,29 @@ def test_extract_composer_refs():
     assert engine_mod._composer_file_refs_in_text("/home/u/hermes/composer-imagez/x.png", roots) == set()
     assert engine_mod._composer_file_refs_in_text("/home/u/hermes/composer-images/../x.png", roots) == set()
     assert engine_mod._composer_file_refs_in_text("just some text", roots) == set()
+    # an attachments-dir ref outside a known root is not ours to touch
+    assert engine_mod._composer_file_refs_in_text(
+        "/tmp/Hermes/attachments/pasted_content_1_aaa.txt", roots
+    ) == set()
+
+
+def test_extract_staging_attachments_ref():
+    """file.attach stages a copy in <HERMES_HOME>/attachments and the saved message
+    references THAT path, not the composer-pastes original (live format, 2026-11-24)."""
+    roots = [Path("C:/Users/jd/AppData/Local/hermes")]
+    content = (
+        "@file:C:\\Users\\jd\\AppData\\Local\\hermes\\attachments"
+        "\\pasted_content_2026-11-24_04-16-21-556_2d5e21.txt\n\n"
+        "--- Attached Context ---\n\n\ud83d\udcc4 @file:C:/Users/jd/AppData/Local/hermes/"
+        "attachments/pasted_content_2026-11-24_04-16-21-556_2d5e21.txt"
+    )
+    assert engine_mod._composer_file_refs_in_text(content, roots) == {
+        str(Path("C:/Users/jd/AppData/Local/hermes/attachments/pasted_content_2026-11-24_04-16-21-556_2d5e21.txt"))
+    }
+    # the word 'attachments' in prose alone must not match
+    assert engine_mod._composer_file_refs_in_text(
+        "see the attachments folder", roots
+    ) == set()
 
 
 def test_burn_purges_unique_composer_files(isolated_hermes_env, monkeypatch):
@@ -199,3 +226,71 @@ def test_burn_without_composer_refs_is_unchanged(isolated_hermes_env, monkeypatc
     assert res.get("composer_files_purged") == 0, res
     assert res.get("composer_purged") == [], res
     assert not native.exists()
+
+
+def test_burn_purges_staged_copy_and_composer_twin(isolated_hermes_env, monkeypatch):
+    """The live 2026-11-24 leak: the message references <HERMES_HOME>/attachments/<name>,
+    while the composer-pastes original (same bytes, never referenced again) survives."""
+    env = isolated_hermes_env
+    eng = _engine(env, monkeypatch)
+    home_root, _ = _roots(env)
+
+    name = "pasted_content_2026-11-24_04-16-21-556_2d5e21.txt"
+    staged = _make_composer_file(home_root, "attachments", name, b"personal paste bytes")
+    twin = _make_composer_file(home_root, "composer-pastes", name, b"personal paste bytes")
+    sess_id = "sess-paste-staging"
+    _make_session(env, sess_id, f"@file:{staged.as_posix()}\n\n--- Attached Context ---")
+
+    eng.enable_session(sess_id, mode="strict")
+    res = eng.burn_session(sess_id, reason="burn")
+    assert res.get("ok") is True, res
+    assert res.get("composer_files_purged") == 2, res  # staged copy AND its twin
+    assert res.get("pending_burn") is False, res
+    assert not staged.exists()
+    assert not twin.exists()
+
+    vt = eng.verify_zero_trace(sess_id)
+    assert vt.get("composer_files_found") == 0, vt
+    assert vt.get("zero_trace") is True, vt
+
+
+def test_burn_keeps_shared_staged_file_and_twin(isolated_hermes_env, monkeypatch):
+    """Another live session referencing the same staged path keeps both the copy and its
+    composer twin (staging names are unique per paste, so a basename match is the same file)."""
+    env = isolated_hermes_env
+    eng = _engine(env, monkeypatch)
+    home_root, _ = _roots(env)
+
+    name = "pasted_content_2026-11-24_05-00-00-000_aaaa11.txt"
+    staged = _make_composer_file(home_root, "attachments", name, b"shared bytes")
+    twin = _make_composer_file(home_root, "composer-pastes", name, b"shared bytes")
+    content = f"@file:{staged.as_posix()}"
+    _make_session(env, "sess-shared-a", content)
+    _make_session(env, "sess-shared-b", content)  # another session still owns these bytes
+
+    eng.enable_session("sess-shared-a", mode="strict")
+    res = eng.burn_session("sess-shared-a", reason="burn")
+    assert res.get("ok") is True, res
+    assert res.get("composer_files_purged") == 0, res
+    assert staged.exists()
+    assert twin.exists()
+
+
+def test_burn_ignores_unreferenced_attachments_file(isolated_hermes_env, monkeypatch):
+    """A file sitting in attachments/ that the burning session never referenced is out
+    of scope for this burn (no scope creep into other sessions' staged files)."""
+    env = isolated_hermes_env
+    eng = _engine(env, monkeypatch)
+    home_root, _ = _roots(env)
+
+    stranger = _make_composer_file(home_root, "attachments", "other_session_file.txt")
+    paste = _make_composer_file(home_root, "composer-pastes", "mine_2026-11-24_06-00-00_112233.txt")
+    sess_id = "sess-scope-check"
+    _make_session(env, sess_id, f"@file:`{paste.as_posix()}`")
+
+    eng.enable_session(sess_id, mode="strict")
+    res = eng.burn_session(sess_id, reason="burn")
+    assert res.get("ok") is True, res
+    assert res.get("composer_files_purged") == 1, res
+    assert not paste.exists()
+    assert stranger.exists()

@@ -285,6 +285,12 @@ def _extract_media_refs(text: str) -> set[tuple[str, str]]:
 # path in messages.content is the only mapping, so burn captures those paths.
 COMPOSER_CACHE_DIRS = ("composer-images", "composer-pastes")
 
+# file.attach (paste chips, attached files) also stages a copy under
+# <HERMES_HOME>/attachments and the saved message references THAT copy — the composer
+# original is then orphaned. Burn purges both, so the staging dir joins the scope.
+ATTACHMENTS_DIRNAME = "attachments"
+STAGING_CACHE_DIRS = COMPOSER_CACHE_DIRS + (ATTACHMENTS_DIRNAME,)
+
 # Absolute path into a composer cache dir, as embedded in message content. Plain,
 # backtick-quoted (@image:`...` / @file:`...`), or file:// URI form. Intermediate dir
 # components may contain spaces (user profiles, "Application Support"); the generator
@@ -295,7 +301,7 @@ _COMPOSER_FILE_REF_RE = re.compile(
     # component must end in a non-space before its separator, so the match cannot
     # stride across prose between two paths ("x.txt and /home/u/...").
     r"(?:[^\\/:*?\"<>|`'\",;()\[\]{}=]*[^\\/:*?\"<>|`'\",;()\[\]{}=\s][\\/])*"
-    r"(?:composer-images|composer-pastes)[/\\]"  # the cache dir
+    r"(?:composer-images|composer-pastes|attachments)[/\\]"  # the cache dir
     r"([^\\/:*?\"<>|`'\",;()\[\]{}=\s]+)"       # filename
 )
 
@@ -306,8 +312,8 @@ def _under_composer_root(path: Path, root: Path) -> bool:
 
 
 def _composer_file_refs_in_text(text: str, roots: list[Path]) -> set[str]:
-    """Absolute paths into a known composer cache root referenced by ``text`` (empty if none)."""
-    if not text or not ("composer-images" in text or "composer-pastes" in text):
+    """Absolute paths into a known composer/staging cache root referenced by ``text`` (empty if none)."""
+    if not text or not ("composer-images" in text or "composer-pastes" in text or "attachments" in text):
         return set()
     found: set[str] = set()
     for match in _COMPOSER_FILE_REF_RE.finditer(text):
@@ -324,7 +330,7 @@ def _composer_file_refs_in_text(text: str, roots: list[Path]) -> set[str]:
         path = Path(candidate)
         if not path.name or path.name in (".", "..") or ".." in path.parts:
             continue
-        if path.parent.name not in COMPOSER_CACHE_DIRS:
+        if path.parent.name not in STAGING_CACHE_DIRS:
             continue
         if not any(_under_composer_root(path, root) for root in roots):
             continue  # same cache dir name outside a known root: not ours to touch
@@ -1227,7 +1233,8 @@ class IncognitoEngine:
                 try:
                     rows = conn.execute(
                         "SELECT content FROM messages WHERE session_id = ? "
-                        "AND (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%')",
+                        "AND (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%'"
+                        " OR content LIKE '%attachments%')",
                         (sid,),
                     ).fetchall()
                 except sqlite3.Error as exc:
@@ -1237,19 +1244,47 @@ class IncognitoEngine:
                 for (content,) in rows:
                     found |= _composer_file_refs_in_text(content, roots)
                 if found:
+                    found |= self._staging_twins(found)
                     refs[sid] = sorted(found)
         finally:
             conn.close()
         return refs
 
+    def _staging_twins(self, found: set[str]) -> set[str]:
+        """Staging siblings (same basename, other staging dir, known root) of captured paths.
+
+        ``file.attach`` copies a composer-cache file into ``<HERMES_HOME>/attachments`` and
+        the saved message references the copy — the composer original is then orphaned, so
+        both belong to the session's bytes. Staging names are unique per attachment
+        (timestamp + random hex), so a basename match under a known root is the same
+        attachment lineage. Only files that exist at capture time are added.
+        """
+        twins: set[str] = set()
+        for path_str in found:
+            path = Path(path_str)
+            for root in self._composer_cache_roots():
+                for dirname in STAGING_CACHE_DIRS:
+                    if dirname == path.parent.name:
+                        continue
+                    twin = root / dirname / path.name
+                    try:
+                        if twin.is_file():
+                            twins.add(str(twin))
+                    except OSError:
+                        continue
+        return twins
+
     def _composer_file_shared(self, state_db: Path, file_path: str, target_ids: set[str]) -> bool:
         """True if any message row OUTSIDE the burning set still references this file.
 
         Uses the same normalizing extractor as the capture step, so separator, quoting,
-        URI, and percent-encoding variants all compare equal. Rows of the burning sessions
-        themselves don't count: they go away with the burn (a deferred delete re-checks on
-        retry). On a read failure the file is KEPT — a live reference would dangle if we
-        deleted it, and the retry re-checks once the store is readable.
+        URI, and percent-encoding variants all compare equal. A basename match under any
+        staging dir also counts: a staged copy and its composer twin are the same
+        attachment lineage (unique per-attachment names), and messages may reference
+        only one of the two. Rows of the burning sessions themselves don't count: they
+        go away with the burn (a deferred delete re-checks on retry). On a read failure
+        the file is KEPT — a live reference would dangle if we deleted it, and the
+        retry re-checks once the store is readable.
         """
         if not state_db.exists():
             return False
@@ -1258,7 +1293,8 @@ class IncognitoEngine:
             try:
                 rows = conn.execute(
                     "SELECT session_id, content FROM messages "
-                    "WHERE (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%')"
+                    "WHERE (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%'"
+                    " OR content LIKE '%attachments%')"
                 ).fetchall()
             finally:
                 conn.close()
@@ -1267,10 +1303,14 @@ class IncognitoEngine:
             return True
         roots = self._composer_cache_roots()
         target = str(Path(file_path))
+        target_name = Path(file_path).name
         for sid, content in rows:
             if sid in target_ids:
                 continue
-            if target in _composer_file_refs_in_text(content, roots):
+            refs = _composer_file_refs_in_text(content, roots)
+            if target in refs:
+                return True
+            if any(Path(ref).name == target_name for ref in refs):
                 return True
         return False
 
@@ -1401,7 +1441,7 @@ class IncognitoEngine:
             path = Path(file_path)
             if not path.name or path.name in (".", "..") or ".." in path.parts:
                 return  # stale/foreign ref: nothing to do
-            if path.parent.name not in COMPOSER_CACHE_DIRS:
+            if path.parent.name not in STAGING_CACHE_DIRS:
                 return
             if not any(_under_composer_root(path, root) for root in self._composer_cache_roots()):
                 return  # root moved since the ref was captured: don't touch an unknown tree
