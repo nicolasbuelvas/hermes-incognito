@@ -635,10 +635,19 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
         const status = await fetch(ctx, sessionId)
         if (sessionId && status?.burned) {
           forgetChat(sessionId)
+          purgeTranscriptTail(sessionId)
           return null
         }
         masking = maskingFor(status, sessionId)
-      } catch {
+        if (!masking) {
+          tattle('warning', `blocked send: masking status unreadable (session=${sessionId || 'next'})`, {
+            response: status === null || status === undefined ? 'no response' : 'unusable shape'
+          })
+        }
+      } catch (error) {
+        tattle('warning', `blocked send: masking status check threw (session=${sessionId || 'next'})`, {
+          error: errText(error)
+        })
         masking = null
       }
       if (!masking) {
@@ -668,7 +677,8 @@ export function makeMaskingMiddleware(ctx, { getSessionId = () => host?.state?.f
         masked: result.text
       })
       return { ...draft, text: result.text }
-    } catch {
+    } catch (error) {
+      tattle('warning', 'blocked send: masking failed', { error: errText(error) })
       notify('warning', MASK_BLOCKED.error)
       return null
     }
@@ -699,32 +709,61 @@ function notifyStateListeners() {
   }
 }
 
+function errText(error) {
+  try {
+    return error && error.message ? error.message : String(error)
+  } catch {
+    return String(error)
+  }
+}
+
+/** Log a diagnostic line. Never throws: logging must not be able to break a send. */
+function tattle(kind, message, detail) {
+  try {
+    const line = `[incognito] ${message}${detail === undefined ? '' : ' ' + JSON.stringify(detail)}`
+    const log = host?.logs
+    if (typeof log === 'function') log(kind, line)
+    else console.error(line)
+  } catch {
+    // The tattle is best-effort
+  }
+}
+
 async function callBackend(ctx, action, payload = {}) {
+  let response = null
+  const errors = []
   try {
     if (ctx && typeof ctx.rest === 'function') {
       const isGet = action === 'status' && Object.keys(payload || {}).every(k => k === 'session_id')
       if (isGet) {
         const query = payload?.session_id ? `?session_id=${encodeURIComponent(payload.session_id)}` : ''
         const res = await ctx.rest(`/${action}${query}`)
-        if (res) return res
+        if (res) response = res
       } else {
         const res = await ctx.rest(`/${action}`, { method: 'POST', body: payload })
-        if (res) return res
+        if (res) response = res
       }
     }
-  } catch {
+  } catch (error) {
+    errors.push(`rest=${errText(error)}`)
+  }
+  if (!response) {
     // Fall back to gateway JSON-RPC
-  }
-
-  try {
-    if (host && typeof host.request === 'function') {
-      const res = await host.request(`plugin.incognito.${action}`, payload)
-      if (res) return res
+    try {
+      if (host && typeof host.request === 'function') {
+        const res = await host.request(`plugin.incognito.${action}`, payload)
+        if (res) response = res
+      }
+    } catch (error) {
+      errors.push(`rpc=${errText(error)}`)
     }
-  } catch {
-    // Both transports unavailable
   }
-  return null
+  if (response == null) {
+    tattle('warning', `backend call returned nothing: ${action}`, {
+      errors: errors.length ? errors : 'no error surfaced'
+    })
+  }
+  return response
 }
 
 function notify(kind, message) {
@@ -803,6 +842,73 @@ async function setMasking(ctx, sessionId, status, on) {
 
 const burnHosts = new Set()
 
+// The renderer keeps a display cache of each chat's transcript tail in its own local storage
+// (written by the app, not by us). Key: 'hermes.transcript-tail.v2:' + JSON array
+// [connectionId, profile, sessionId]; an index of those suffixes lives under its own key.
+const TAIL_KEY_PREFIX = 'hermes.transcript-tail.v2:'
+const TAIL_INDEX_KEY = 'hermes.transcript-tail.v2-index'
+
+/**
+ * Drop the Desktop display cache of a burned chat. The gateway purge removes the canonical
+ * records; this removes what Chromium keeps for display. Best effort: never throws, returns
+ * the number of cache entries removed.
+ */
+export function purgeTranscriptTail(sessionId) {
+  const sid = (sessionId ?? '').trim()
+  if (!sid) return 0
+  let storage
+  try {
+    storage = window?.localStorage
+  } catch {
+    return 0
+  }
+  if (!storage) return 0
+  let removed = 0
+  try {
+    const ownerOf = raw => {
+      if (typeof raw !== 'string' || !raw.startsWith('[')) return null
+      try {
+        const parts = JSON.parse(raw)
+        return Array.isArray(parts) ? (parts[2] ?? null) : null
+      } catch {
+        return null
+      }
+    }
+    const stale = []
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i)
+      if (key && key.startsWith(TAIL_KEY_PREFIX) && ownerOf(key.slice(TAIL_KEY_PREFIX.length)) === sid) {
+        stale.push(key)
+      }
+    }
+    for (const key of stale) {
+      try {
+        storage.removeItem(key)
+        removed++
+      } catch {
+        // Best effort
+      }
+    }
+    if (removed) {
+      try {
+        const raw = storage.getItem(TAIL_INDEX_KEY)
+        if (raw) {
+          const index = JSON.parse(raw)
+          if (Array.isArray(index)) {
+            const next = index.filter(entry => ownerOf(entry) !== sid)
+            if (next.length !== index.length) storage.setItem(TAIL_INDEX_KEY, JSON.stringify(next))
+          }
+        }
+      } catch {
+        // A corrupt index does not protect data; the entries are gone
+      }
+    }
+  } catch {
+    // A hostile localStorage must not break the burn
+  }
+  return removed
+}
+
 async function performBurn(ctx, sessionId) {
   const response = await callBackend(ctx, 'burn', { session_id: sessionId })
   const result = response?.receipt || response
@@ -810,6 +916,7 @@ async function performBurn(ctx, sessionId) {
     throw new Error(response?.error || result?.error || "Couldn't delete this chat.")
   }
   forgetChat(sessionId)
+  purgeTranscriptTail(sessionId)
   notifyStateListeners()
   notify(
     'info',
@@ -974,7 +1081,10 @@ function useIncognitoStatus(ctx, sessionId, { poll = false } = {}) {
   const refresh = useCallback(async () => {
     const res = await fetchStatus(ctx, sessionId)
     if (res) {
-      if (sessionId && res.burned) forgetChat(sessionId)
+      if (sessionId && res.burned) {
+        forgetChat(sessionId)
+        purgeTranscriptTail(sessionId)
+      }
       setStatus(res)
       setOffline(false)
     } else {
@@ -1900,6 +2010,7 @@ export default {
       const payload = event?.payload
       if (payload?.burned === true && typeof payload.session_id === 'string' && payload.session_id) {
         forgetChat(payload.session_id)
+        purgeTranscriptTail(payload.session_id)
       }
       refreshAll()
     })
@@ -1913,6 +2024,7 @@ export default {
           const status = await fetchStatus(ctx, sid)
           if (vaults.get(sid) === vault && (status?.burned || maskingFor(status, sid)?.on === false)) {
             forgetChat(sid)
+            if (status?.burned) purgeTranscriptTail(sid)
           }
         }
       } finally {

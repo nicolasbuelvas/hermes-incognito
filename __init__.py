@@ -69,17 +69,38 @@ def _resolve_session_id(kwargs: dict[str, Any], explicit: str = "") -> str:
     return sid
 
 
-def register(ctx: Any) -> None:
-    """Entry point called by Hermes plugin loader to register capabilities."""
-    engine = get_engine()
-    emit_to_session = getattr(ctx, "emit_to_session", None)
-    if callable(emit_to_session):
-        def notify_burned(session_id: str) -> None:
+def _make_burn_callback(engine: Any, emit_to_session: Any) -> Any:
+    """Compose the on_burn_complete callback: external-store purges + Desktop notify.
+
+    Both purges are best-effort (log-only) — archive or LCM availability must never
+    block or roll back the local zero-trace burn.
+    """
+
+    def on_burn_complete(session_id: str) -> None:
+        # Gate 2: purge the external memory archive (RetainDB) ...
+        try:
+            engine.purge_memory_store(session_id)
+        except Exception:
+            logger.debug("Incognito archive purge raised (burn unaffected)")
+        # Gate 3b: ... and the LCM store (lcm.db), which indexes live turns.
+        try:
+            engine.purge_lcm_store(session_id)
+        except Exception:
+            logger.debug("Incognito LCM purge raised (burn unaffected)")
+        if callable(emit_to_session):
             emit_to_session(session_id, "state.changed", {
                 "session_id": session_id, "active": False, "burned": True
             })
 
-        engine.on_burn_complete = notify_burned
+    return on_burn_complete
+
+
+def register(ctx: Any) -> None:
+    """Entry point called by Hermes plugin loader to register capabilities."""
+    engine = get_engine()
+    emit_to_session = getattr(ctx, "emit_to_session", None)
+
+    engine.on_burn_complete = _make_burn_callback(engine, emit_to_session)
 
     # -------------------------------------------------------------------------
     # 1. Register Tools
@@ -124,7 +145,12 @@ def register(ctx: Any) -> None:
         except IncognitoActivationError as exc:
             return {"action": "block", "message": f"Could not activate Incognito. {exc}"}
         except Exception as exc:
-            logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
+            logger.warning(
+                "Incognito could not mask this turn (%s: %s); blocking it.",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}
         if engine.is_incognito(sid):
             engine.touch_session(sid)

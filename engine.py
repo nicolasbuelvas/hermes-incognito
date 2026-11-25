@@ -17,14 +17,22 @@ import stat
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from urllib.parse import quote, urlparse
 
 try:
     from . import pii
 except ImportError:
     import pii  # type: ignore[no-redef]
+
+try:
+    from . import lcm_purge
+except ImportError:
+    import lcm_purge  # type: ignore[no-redef]
 
 # Allowed Hermes public API imports with fallbacks for standalone/pytest environments
 try:
@@ -41,11 +49,110 @@ try:
 except ImportError:
     SessionDB = None  # type: ignore[assignment,misc]
 
+# ── Storage compatibility ──────────────────────────────────────────────────
+# Hermes >= 2026-11-23 (refactor(state)!: remove the old session store)
+# shrank hermes_state.SessionDB to a compatibility shim carrying only the
+# verbs listed in the plugin guide; everything else raises AttributeError.
+# The verbs this engine still needs map onto the storage interface:
+#   get_session_model_config_value    -> store.sessions.get_model_config_value
+#   patch_session_model_config        -> store.sessions.patch_model_config
+#   set_session_hidden                -> store.sessions.set_hidden
+#   session_ids_with_model_config_key -> store.sessions.session_ids_with_model_config_key
+#   get_session_delete_targets        -> store.sessions.delete_targets
+# Handles that already carry those verbs (older cores, core-free test mocks)
+# are used as-is; only the reduced shim gets wrapped.
+_LEGACY_DB_VERBS = (
+    "get_session_model_config_value",
+    "patch_session_model_config",
+    "set_session_hidden",
+    "session_ids_with_model_config_key",
+    "get_session_delete_targets",
+)
+
+
+class _CompatSessionDB:
+    """Legacy SessionDB verb surface over the modern storage interface.
+
+    Guide verbs (get_session, delete_session, ...) delegate to the shim
+    handle; the dropped verbs go through persistence_assembly.open_persistence
+    on the same state.db file. The store handle opens lazily on first dropped-verb
+    use and releases at close(), mirroring the old single-connection lifecycle.
+    """
+
+    def __init__(self, base: Any, db_path: Path) -> None:
+        self._base = base
+        self._db_path = Path(db_path)
+        self._stack = None  # type: ignore[assignment]
+
+    # Store handle is kept as (stack, store) pair to avoid re-entry surprises.
+    def _store(self) -> Any:
+        if self._stack is None:
+            from contextlib import ExitStack
+            from persistence_assembly import open_persistence, profile_scope
+
+            stack = ExitStack()
+            store = stack.enter_context(
+                open_persistence(profile_scope(home=self._db_path.parent), eager=True)
+            )
+            self._stack = (stack, store)
+        return self._stack[1]
+
+    def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
+        return self._store().sessions.get_model_config_value(session_id, key, default)
+
+    def patch_session_model_config(self, session_id: str, patch: dict[str, Any]) -> None:
+        self._store().sessions.patch_model_config(session_id, patch)
+
+    def set_session_hidden(self, session_id: str, hidden: bool) -> Any:
+        return self._store().sessions.set_hidden(session_id, bool(hidden))
+
+    def session_ids_with_model_config_key(self, key: str) -> list[str]:
+        return list(self._store().sessions.session_ids_with_model_config_key(key))
+
+    def get_session_delete_targets(self, session_id: str) -> list[str]:
+        return list(self._store().sessions.delete_targets(session_id))
+
+    def close(self) -> None:
+        if self._stack is not None:
+            stack, _ = self._stack
+            self._stack = None
+            stack.close()
+        self._base.close()
+
+    def __enter__(self) -> "_CompatSessionDB":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def _open_session_db(db_path: Path) -> Any:
+    """Open the state store with the full legacy verb surface this engine uses.
+
+    Passes the handle through unchanged when it already carries the legacy
+    verbs; wraps the reduced compatibility shim with :class:`_CompatSessionDB`.
+    """
+    if SessionDB is None:
+        raise RuntimeError("SessionDB is unavailable; cannot open the state store")
+    handle = SessionDB(db_path=Path(db_path))
+    if all(hasattr(handle, verb) for verb in _LEGACY_DB_VERBS):
+        return handle
+    return _CompatSessionDB(handle, db_path)
+
 try:
     from hermes_cli.config import load_config_readonly
 except ImportError:
     def load_config_readonly() -> dict[str, Any]:
         return {}
+
+try:
+    from agent.secret_scope import get_secret
+except ImportError:
+    def get_secret(name: str, default: str = "") -> str:
+        return default
 
 try:
     from plugins.plugin_storage import plugin_data_dir
@@ -158,6 +265,79 @@ def _flat_hook_files(directory: Path, session_id: str) -> Iterator[Path]:
                 yield path
 
 
+# Store-relative reference to a committed native-input media file: the content-addressed
+# ``<sha256>/<name>`` path under ``<home>/cache/documents/native-inputs``. The reference is
+# embedded in message content as ``[Image attached at: ...native-inputs/<sha256>/<name>]``; the
+# image bytes themselves live at that store path and are NOT removed by the transcript scrub.
+_MEDIA_REF = re.compile(r"native-inputs[\\/]+([0-9a-fA-F]{64})[\\/]+([^\s\"'\]]+)")
+
+
+def _extract_media_refs(text: str) -> set[tuple[str, str]]:
+    """Return the ``(sha256, name)`` native-input store refs embedded in ``text`` (empty if none)."""
+    if not text or "native-inputs" not in text:
+        return set()
+    return {(m.group(1).lower(), m.group(2)) for m in _MEDIA_REF.finditer(text)}
+
+
+# Desktop composer attachment caches, keyed by directory name only: the renderer writes
+# images under <userData>/composer-images and text pastes under <HERMES_HOME>/composer-pastes
+# (with a legacy <userData>/composer-pastes). Filenames carry no session id; the absolute
+# path in messages.content is the only mapping, so burn captures those paths.
+COMPOSER_CACHE_DIRS = ("composer-images", "composer-pastes")
+
+# file.attach (paste chips, attached files) also stages a copy under
+# <HERMES_HOME>/attachments and the saved message references THAT copy — the composer
+# original is then orphaned. Burn purges both, so the staging dir joins the scope.
+ATTACHMENTS_DIRNAME = "attachments"
+STAGING_CACHE_DIRS = COMPOSER_CACHE_DIRS + (ATTACHMENTS_DIRNAME,)
+
+# Absolute path into a composer cache dir, as embedded in message content. Plain,
+# backtick-quoted (@image:`...` / @file:`...`), or file:// URI form. Intermediate dir
+# components may contain spaces (user profiles, "Application Support"); the generator
+# sanitizes filenames so the final component never does.
+_COMPOSER_FILE_REF_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/)"                      # drive letter or POSIX root
+    # intermediate dirs; spaces allowed ("Application Support", "John Doe") but a
+    # component must end in a non-space before its separator, so the match cannot
+    # stride across prose between two paths ("x.txt and /home/u/...").
+    r"(?:[^\\/:*?\"<>|`'\",;()\[\]{}=]*[^\\/:*?\"<>|`'\",;()\[\]{}=\s][\\/])*"
+    r"(?:composer-images|composer-pastes|attachments)[/\\]"  # the cache dir
+    r"([^\\/:*?\"<>|`'\",;()\[\]{}=\s]+)"       # filename
+)
+
+
+def _under_composer_root(path: Path, root: Path) -> bool:
+    parts, root_parts = [p.casefold() for p in path.parts], [p.casefold() for p in root.parts]
+    return len(parts) > len(root_parts) and parts[: len(root_parts)] == root_parts
+
+
+def _composer_file_refs_in_text(text: str, roots: list[Path]) -> set[str]:
+    """Absolute paths into a known composer/staging cache root referenced by ``text`` (empty if none)."""
+    if not text or not ("composer-images" in text or "composer-pastes" in text or "attachments" in text):
+        return set()
+    found: set[str] = set()
+    for match in _COMPOSER_FILE_REF_RE.finditer(text):
+        candidate = match.group(0)
+        if candidate.lower().startswith("file://"):
+            candidate = candidate[7:]
+            if candidate.startswith("/"):  # file:///C:/... -> C:/...
+                candidate = candidate[1:]
+        # A match may start at the slash left before a drive letter (file:///C:/...):
+        # /C:/x is drive-relative — normalize to the absolute drive form.
+        if candidate.startswith("/") and len(candidate) > 3 and candidate[1] == ":" and candidate[2] in "/\\":
+            candidate = candidate[1:]
+        candidate = urllib.parse.unquote(candidate)
+        path = Path(candidate)
+        if not path.name or path.name in (".", "..") or ".." in path.parts:
+            continue
+        if path.parent.name not in STAGING_CACHE_DIRS:
+            continue
+        if not any(_under_composer_root(path, root) for root in roots):
+            continue  # same cache dir name outside a known root: not ours to touch
+        found.add(str(path))
+    return found
+
+
 def _is_pid_alive(pid: int) -> bool:
     """Check whether a PID is alive without using os.kill(pid, 0) on Windows."""
     if pid <= 0:
@@ -210,6 +390,15 @@ def _live_head_for(leases: dict[str, Any], session_id: str) -> str | None:
         ):
             return sid
     return None
+
+
+def _is_local_retaindb_url(base_url: str) -> bool:
+    """True for a localhost/loopback RetainDB base_url (served without auth)."""
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
 
 
 class IncognitoActivationError(RuntimeError):
@@ -616,7 +805,7 @@ class IncognitoEngine:
 
         previous = {}
         try:
-            db = SessionDB(db_path=state_db)
+            db = _open_session_db(state_db)
             try:
                 for sid in markers:
                     row = db.get_session(sid)
@@ -662,7 +851,7 @@ class IncognitoEngine:
             finally:
                 db.close()
         except Exception as exc:
-            logger.warning("Could not update Incognito chat history (%s)", type(exc).__name__)
+            logger.warning("Could not update Incognito chat history (%s: %s)", type(exc).__name__, exc, exc_info=True)
             return False
         return True
 
@@ -748,7 +937,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         for sid in db.session_ids_with_model_config_key("incognito"):
                             if isinstance(sid, str) and sid:
@@ -811,7 +1000,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db.set_session_hidden(session_id, True)
                         db.patch_session_model_config(session_id, {"incognito": lease})
@@ -905,7 +1094,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db.set_session_hidden(new_session_id, True)
                         db.patch_session_model_config(new_session_id, {"incognito": new_lease})
@@ -947,6 +1136,184 @@ class IncognitoEngine:
             logger.debug("Cannot verify incognito database cleanup: %s", exc)
             return None
 
+    def _extract_media_store_refs(self, state_db: Path, target_ids: set[str]) -> dict[str, list[str]]:
+        """Map each target session to the native-input store refs (``<sha256>/<name>``) its
+        messages reference. Read-only.
+
+        Captured BEFORE ``delete_session`` removes the message rows, and persisted in the burn
+        lease, so a deferred retry can still scrub the media bytes after the rows are gone.
+        """
+        refs: dict[str, list[str]] = {}
+        if not state_db.exists() or not target_ids:
+            return refs
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            logger.debug("Cannot open state.db for media-ref extraction: %s", exc)
+            return refs
+        try:
+            for sid in sorted(target_ids):
+                try:
+                    rows = conn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? "
+                        "AND content LIKE '%native-inputs%'",
+                        (sid,),
+                    ).fetchall()
+                except sqlite3.Error as exc:
+                    logger.debug("Cannot read media refs for %s: %s", sid, exc)
+                    continue
+                found: set[tuple[str, str]] = set()
+                for (content,) in rows:
+                    found |= _extract_media_refs(content)
+                if found:
+                    refs[sid] = sorted(f"{sha}/{name}" for sha, name in found)
+        finally:
+            conn.close()
+        return refs
+
+    def _media_ref_shared(self, state_db: Path, sha256: str) -> bool:
+        """True if any message row still references this content hash.
+
+        Called after ``delete_session``, so a positive count means a DIFFERENT (non-burning)
+        session still owns these bytes; the ref is kept, not deleted, so that reference stays
+        valid. A deferred delete (rows still present) counts too, which is conservatively safe:
+        the burn retries and re-checks once the rows are gone.
+        """
+        if not state_db.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+            try:
+                count = conn.execute(
+                    "SELECT count(DISTINCT session_id) FROM messages WHERE content LIKE ?",
+                    (f"%{sha256}%",),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            return count > 0
+        except sqlite3.Error as exc:
+            logger.debug("Cannot check media-ref sharing for %s: %s", sha256[:12], exc)
+            return False
+
+    def _composer_cache_roots(self) -> list[Path]:
+        """Desktop composer attachment cache roots on this host.
+
+        ``<HERMES_HOME>/composer-pastes`` (current app: text pastes) plus the Electron
+        userData dir (``<APPDATA>/Hermes`` on Windows, ``$XDG_CONFIG_HOME/Hermes``
+        elsewhere), which holds ``composer-images`` and legacy ``composer-pastes``.
+        """
+        roots = [self.home_dir]
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                roots.append(Path(appdata) / "Hermes")
+        else:
+            config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+            roots.append(Path(config) / "Hermes")
+        return roots
+
+    def _extract_composer_file_refs(self, state_db: Path, target_ids: set[str]) -> dict[str, list[str]]:
+        """Map each target session to the composer-cache file paths its messages reference.
+
+        Read-only. Captured BEFORE ``delete_session`` removes the message rows and persisted
+        in the burn lease (mirrors :meth:`_extract_media_store_refs`), so a deferred retry can
+        still scrub the bytes after the rows are gone.
+        """
+        refs: dict[str, list[str]] = {}
+        if not state_db.exists() or not target_ids:
+            return refs
+        roots = self._composer_cache_roots()
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            logger.debug("Cannot open state.db for composer-ref extraction: %s", exc)
+            return refs
+        try:
+            for sid in sorted(target_ids):
+                try:
+                    rows = conn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? "
+                        "AND (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%'"
+                        " OR content LIKE '%attachments%')",
+                        (sid,),
+                    ).fetchall()
+                except sqlite3.Error as exc:
+                    logger.debug("Cannot read composer refs for %s: %s", sid, exc)
+                    continue
+                found: set[str] = set()
+                for (content,) in rows:
+                    found |= _composer_file_refs_in_text(content, roots)
+                if found:
+                    found |= self._staging_twins(found)
+                    refs[sid] = sorted(found)
+        finally:
+            conn.close()
+        return refs
+
+    def _staging_twins(self, found: set[str]) -> set[str]:
+        """Staging siblings (same basename, other staging dir, known root) of captured paths.
+
+        ``file.attach`` copies a composer-cache file into ``<HERMES_HOME>/attachments`` and
+        the saved message references the copy — the composer original is then orphaned, so
+        both belong to the session's bytes. Staging names are unique per attachment
+        (timestamp + random hex), so a basename match under a known root is the same
+        attachment lineage. Only files that exist at capture time are added.
+        """
+        twins: set[str] = set()
+        for path_str in found:
+            path = Path(path_str)
+            for root in self._composer_cache_roots():
+                for dirname in STAGING_CACHE_DIRS:
+                    if dirname == path.parent.name:
+                        continue
+                    twin = root / dirname / path.name
+                    try:
+                        if twin.is_file():
+                            twins.add(str(twin))
+                    except OSError:
+                        continue
+        return twins
+
+    def _composer_file_shared(self, state_db: Path, file_path: str, target_ids: set[str]) -> bool:
+        """True if any message row OUTSIDE the burning set still references this file.
+
+        Uses the same normalizing extractor as the capture step, so separator, quoting,
+        URI, and percent-encoding variants all compare equal. A basename match under any
+        staging dir also counts: a staged copy and its composer twin are the same
+        attachment lineage (unique per-attachment names), and messages may reference
+        only one of the two. Rows of the burning sessions themselves don't count: they
+        go away with the burn (a deferred delete re-checks on retry). On a read failure
+        the file is KEPT — a live reference would dangle if we deleted it, and the
+        retry re-checks once the store is readable.
+        """
+        if not state_db.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"{state_db.as_uri()}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT session_id, content FROM messages "
+                    "WHERE (content LIKE '%composer-images%' OR content LIKE '%composer-pastes%'"
+                    " OR content LIKE '%attachments%')"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.debug("Cannot check composer-file sharing for %s: %s", file_path, exc)
+            return True
+        roots = self._composer_cache_roots()
+        target = str(Path(file_path))
+        target_name = Path(file_path).name
+        for sid, content in rows:
+            if sid in target_ids:
+                continue
+            refs = _composer_file_refs_in_text(content, roots)
+            if target in refs:
+                return True
+            if any(Path(ref).name == target_name for ref in refs):
+                return True
+        return False
+
     def _schedule_deferred_burn(self, session_id: str, attempt: int = 1) -> None:
         """Retry burning a busy session once its active Gateway turn admission settles."""
         delays = {1: 1.5, 2: 5.0, 3: 15.0}
@@ -971,11 +1338,28 @@ class IncognitoEngine:
         timer.daemon = True
         timer.start()
 
-    def _scrub_burn_files(self, target_ids: set[str]) -> tuple[int, bool]:
-        """Scrub authorized artifacts and report whether any cleanup must be retried."""
+    def _scrub_burn_files(
+        self,
+        target_ids: set[str],
+        media_refs: dict[str, list[str]] | None = None,
+        composer_files: dict[str, list[str]] | None = None,
+    ) -> tuple[int, bool, list[str], list[str]]:
+        """Scrub authorized artifacts and report whether any cleanup must be retried.
+
+        Returns ``(files_scrubbed, files_pending, media_purged, composer_purged)`` where
+        ``media_purged`` lists the store-relative native-input refs confirmed removed and
+        ``composer_purged`` lists the composer-cache file paths confirmed removed (for the
+        zero-trace receipt).
+        """
         zero_fill = self.get_settings().get("zero_fill_files", True)
         files_scrubbed = 0
         files_pending = False
+        media_purged: list[str] = []
+        composer_purged: list[str] = []
+        media_refs = media_refs or {}
+        composer_files = composer_files or {}
+        native_root = self.home_dir / "cache" / "documents" / "native-inputs"
+        state_db = self.home_dir / "state.db"
 
         def _failed(exc: OSError | RuntimeError) -> None:
             nonlocal files_pending
@@ -1007,6 +1391,91 @@ class IncognitoEngine:
             except (OSError, RuntimeError) as exc:
                 _failed(exc)
 
+        def _scrub_media_ref(ref: str) -> None:
+            """Zero-fill + unlink one store-relative native-input ref. A ref still referenced by
+            another (non-burning) session is kept, not deleted, so that reference stays valid."""
+            nonlocal media_purged, files_pending
+            sha, sep, name = ref.partition("/")
+            if not sep or len(sha) != 64 or not name or "/" in name or "\\" in name:
+                return
+            if self._media_ref_shared(state_db, sha):
+                return  # shared: another session still owns these bytes
+            target = native_root / sha / name
+            try:
+                if target.resolve().parts != target.parts:
+                    files_pending = True
+                    return
+                try:
+                    info = target.lstat()
+                except FileNotFoundError:
+                    media_purged.append(ref)  # already gone: not on disk
+                    return
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    files_pending = True
+                    return
+                if zero_fill and info.st_size > 0:
+                    with target.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                target.unlink()
+            except (OSError, RuntimeError) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    files_pending = True
+                    logger.debug("Incognito media cleanup deferred: %s", exc)
+                    return
+            media_purged.append(ref)
+            try:
+                (native_root / sha).rmdir()  # drop the empty content-hash dir if nothing else
+            except OSError:
+                pass
+
+        def _scrub_composer_file(file_path: str) -> None:
+            """Zero-fill + unlink one composer-cache file. A file still referenced by another
+            (non-burning) session is kept, not deleted, so that reference stays valid."""
+            nonlocal composer_purged, files_pending
+            path = Path(file_path)
+            if not path.name or path.name in (".", "..") or ".." in path.parts:
+                return  # stale/foreign ref: nothing to do
+            if path.parent.name not in STAGING_CACHE_DIRS:
+                return
+            if not any(_under_composer_root(path, root) for root in self._composer_cache_roots()):
+                return  # root moved since the ref was captured: don't touch an unknown tree
+            if self._composer_file_shared(state_db, file_path, target_ids):
+                return
+            try:
+                if path.resolve().parts != path.parts:
+                    files_pending = True
+                    return
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    composer_purged.append(file_path)  # already gone: not on disk
+                    return
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    files_pending = True
+                    return
+                if zero_fill and info.st_size > 0:
+                    with path.open("r+b") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if not os.path.samestat(info, opened) or opened.st_nlink != 1:
+                            files_pending = True
+                            return
+                        handle.write(b"\x00" * opened.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                path.unlink()
+            except (OSError, RuntimeError) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    files_pending = True
+                    logger.debug("Incognito composer-file cleanup deferred: %s", exc)
+                    return
+            composer_purged.append(file_path)
+
         try:
             sessions_dir = (self.home_dir / "sessions").resolve()
             hook_outputs_dir = (self.home_dir / "hook_outputs").resolve()
@@ -1015,6 +1484,10 @@ class IncognitoEngine:
                     _scrub_file(path)
                 for path in _flat_hook_files(hook_outputs_dir, sid):
                     _scrub_file(path)
+                for ref in media_refs.get(sid, []):
+                    _scrub_media_ref(ref)
+                for file_path in composer_files.get(sid, []):
+                    _scrub_composer_file(file_path)
 
                 sid_dir = _hook_session_dir(hook_outputs_dir, sid)
                 if sid_dir is None:
@@ -1040,7 +1513,7 @@ class IncognitoEngine:
                         _failed(exc)
         except (OSError, RuntimeError) as exc:
             _failed(exc)
-        return files_scrubbed, files_pending
+        return files_scrubbed, files_pending, media_purged, composer_purged
 
     def burn_session(
         self, session_id: str, reason: str = "burn", *, _retry_attempt: int = 0
@@ -1057,7 +1530,7 @@ class IncognitoEngine:
             db = None
             try:
                 if SessionDB is not None and state_db.exists():
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
             except Exception as exc:
                 logger.debug("Cannot open SessionDB for incognito burn: %s", exc)
 
@@ -1136,6 +1609,20 @@ class IncognitoEngine:
 
                 # Persist recovery before deleting a row that may hold the only incognito marker.
                 lineage = sorted(target_ids)
+                # Capture the native-input media refs the messages reference BEFORE delete_session
+                # removes the rows; merge with any refs a prior (pending) attempt already recorded,
+                # so a deferred retry can still scrub the bytes after the rows are gone.
+                media_by_sid = self._extract_media_store_refs(state_db, set(lineage))
+                composer_by_sid = self._extract_composer_file_refs(state_db, set(lineage))
+                for sid in lineage:
+                    prior = leases.get(sid)
+                    if isinstance(prior, dict):
+                        for ref in prior.get("media_refs", []) or []:
+                            if ref not in media_by_sid.get(sid, []):
+                                media_by_sid.setdefault(sid, []).append(ref)
+                        for file_path in prior.get("composer_files", []) or []:
+                            if file_path not in composer_by_sid.get(sid, []):
+                                composer_by_sid.setdefault(sid, []).append(file_path)
                 for sid in lineage:
                     leases[sid] = {
                         **authorized_leases[sid],
@@ -1143,6 +1630,8 @@ class IncognitoEngine:
                         "pending_burn": True,
                         "expires_at": 0,
                         "lineage_ids": lineage,
+                        "media_refs": media_by_sid.get(sid, []),
+                        "composer_files": composer_by_sid.get(sid, []),
                     }
                 self._write_leases(leases)
 
@@ -1166,7 +1655,9 @@ class IncognitoEngine:
             db_deleted = rows_after == 0 and (
                 db_deleted or bool(rows_before) or bool(authorized_leases[session_id].get("db_deleted"))
             )
-            files_scrubbed, files_pending = self._scrub_burn_files(target_ids)
+            files_scrubbed, files_pending, media_purged, composer_purged = self._scrub_burn_files(
+                target_ids, media_by_sid, composer_by_sid
+            )
             pending_burn = rows_after != 0 or files_pending
 
             vault_keys_cleared = 0
@@ -1208,6 +1699,10 @@ class IncognitoEngine:
                 "pending_burn": pending_burn,
                 "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
+                "media_files_purged": len(media_purged),
+                "media_purged": media_purged,
+                "composer_files_purged": len(composer_purged),
+                "composer_purged": composer_purged,
                 "vault_keys_cleared": vault_keys_cleared,
             }
 
@@ -1239,10 +1734,146 @@ class IncognitoEngine:
                 "pending_burn": pending_burn,
                 "files_pending": files_pending,
                 "files_scrubbed": files_scrubbed,
+                "media_files_purged": len(media_purged),
+                "composer_files_purged": len(composer_purged),
+                "composer_purged": composer_purged,
                 "vault_keys_cleared": vault_keys_cleared,
                 "receipt_id": receipt_id,
                 "timestamp": now_ts,
             }
+
+    # -------------------------------------------------------------------------
+    # 13b. Archive-store purge (RetainDB)
+    # -------------------------------------------------------------------------
+
+    _ARCHIVE_PURGE_DEADLINE_S = 15.0
+    _ARCHIVE_PAGE_LIMIT = 200
+
+    def _retaindb_endpoints(self) -> Optional[Tuple[str, str, str]]:
+        """Resolve (base_url, project, api_key) for the RetainDB memory store, or None if unconfigured.
+
+        Mirrors the RetainDB provider's resolution: scoped secrets first, then the
+        ``memory.retaindb`` config block, then the provider's profile fallback.
+
+        Local endpoints (localhost/loopback) are served without auth, so a missing
+        ``RETAINDB_API_KEY`` only skips a remote store; a configured local store still
+        resolves so the burn can purge it.
+        """
+        try:
+            api_key = get_secret("RETAINDB_API_KEY", "") or ""
+            base_url = re.sub(r"/+$", "", get_secret("RETAINDB_BASE_URL", "") or "")
+            project = get_secret("RETAINDB_PROJECT", "") or ""
+        except Exception:
+            api_key, base_url, project = "", "", ""
+        if not base_url or not project:
+            try:
+                block = (load_config_readonly() or {}).get("memory", {}).get("retaindb", {}) or {}
+                base_url = re.sub(r"/+$", "", str(block.get("base_url") or "") or base_url)
+                project = project or str(block.get("project") or "")
+            except Exception:
+                pass
+        base_url = re.sub(r"/+$", "", base_url or "")
+        if not api_key and not _is_local_retaindb_url(base_url):
+            return None
+        if not base_url:
+            base_url = "https://api.retaindb.com"
+        if not project:
+            profile = os.path.basename(str(self.home_dir))
+            project = f"hermes-{profile}" if profile not in {"", ".hermes"} else "default"
+        return base_url, project, api_key
+
+    def purge_memory_store(self, session_id: str) -> dict[str, Any]:
+        """Best-effort delete of RetainDB memories recorded against *session_id*.
+
+        Called at burn time: the local zero-trace claim does not reach external archive
+        stores, and automatic session ingestion can outlive the session. Uses the SOTA
+        memory routes (``GET /v1/memory/session/{sid}`` + ``DELETE /v1/memory/{id}``):
+        the legacy ``GET /v1/memories?session_id=`` filter is not honored and the legacy
+        delete route is not registered on the deployed server. Log-only failure —
+        archive availability must never block or roll back the local burn.
+        """
+        if not session_id:
+            return {"skipped": "no session id"}
+        endpoints = self._retaindb_endpoints()
+        if endpoints is None:
+            return {"skipped": "retaindb not configured"}
+        base_url, project, api_key = endpoints
+        token = api_key.replace("Bearer ", "").strip()
+        headers = {"x-sdk-runtime": "hermes-incognito"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-API-Key"] = token
+        deadline = time.monotonic() + self._ARCHIVE_PURGE_DEADLINE_S
+        purged = 0
+        try:
+            list_url = (f"{base_url}/v1/memory/session/{quote(session_id, safe='')}"
+                        f"?project={quote(project, safe='')}&include_pending=false")
+            with urllib.request.urlopen(urllib.request.Request(list_url, headers=headers), timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            items = payload.get("memories") if isinstance(payload, dict) else payload
+            for item in items or []:
+                if time.monotonic() > deadline:
+                    break
+                memory_id = item.get("id") if isinstance(item, dict) else None
+                # Overlay entries (ids like "pending:job:idx") are not deletable memory ids.
+                if not memory_id or str(memory_id).startswith("pending:"):
+                    continue
+                req = urllib.request.Request(f"{base_url}/v1/memory/{quote(str(memory_id), safe='')}",
+                                             method="DELETE", headers=headers)
+                try:
+                    urllib.request.urlopen(req, timeout=10)
+                    purged += 1
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 404:
+                        purged += 1  # already gone; treat as idempotent success
+                    else:
+                        raise
+            if purged:
+                logger.info("Incognito burn: purged %d archive-store memories for a burned session", purged)
+            return {"purged": purged}
+        except Exception as exc:
+            logger.debug("Incognito archive purge failed (log-only, burn unaffected): %s", exc)
+            return {"purged": purged, "error": str(exc)}
+
+    def _count_retaindb_memories(self, session_id: str) -> Tuple[Optional[int], str]:
+        """Count *session_id*'s memories in the RetainDB archive store.
+
+        Returns ``(count, status)``: count is an int for a reachable configured store,
+        or None when unconfigured/unreachable (status explains why). A None count means
+        "unknown", not "clean" — verify_zero_trace must not veto the verdict on it.
+        """
+        endpoints = self._retaindb_endpoints()
+        if endpoints is None:
+            return None, "not_configured"
+        base_url, project, api_key = endpoints
+        token = api_key.replace("Bearer ", "").strip()
+        headers = {"x-sdk-runtime": "hermes-incognito"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-API-Key"] = token
+        list_url = f"{base_url}/v1/memory/session/{quote(session_id, safe='')}?project={quote(project)}&include_pending=false"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(list_url, headers=headers), timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            items = payload.get("memories") if isinstance(payload, dict) else payload
+            return (len(items) if items else 0), "ok"
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    # ---------------------------------------------------------------------
+    # 13b. LCM store purge (Gate 3b)
+    # ---------------------------------------------------------------------
+
+    def purge_lcm_store(self, session_id: str) -> dict[str, Any]:
+        """Best-effort delete of *session_id*'s rows from the LCM store (lcm.db).
+
+        Called at burn time (log-only failure — a busy or missing lcm.db must never block
+        the local burn). Implemented in ``lcm_purge`` so the engine's raw-SQL-delete
+        forensics invariant (state.db rows are deleted only through SessionDB) holds by
+        construction: every DELETE in this plugin's burn path that bypasses SessionDB
+        lives in lcm_purge and targets lcm.db only.
+        """
+        return lcm_purge.purge_lcm_store(self.home_dir, session_id)
 
     # -------------------------------------------------------------------------
     # 14. sweep_expired
@@ -1280,7 +1911,7 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             if SessionDB is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = _open_session_db(state_db)
                     try:
                         db_incognito_ids = db.session_ids_with_model_config_key("incognito")
                         saved_members = {
@@ -1367,6 +1998,11 @@ class IncognitoEngine:
             leases = self._read_leases()
             active_lease = session_id in leases
 
+            # Archive-store probe: a configured store with surviving memories is a real
+            # trace; an unknown (unconfigured/unreachable) store does not veto the verdict.
+            retaindb_count, retaindb_status = self._count_retaindb_memories(session_id)
+            retaindb_clean = retaindb_count in (0, None)
+
             session_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
             audit = self._read_audit()
             burn_receipt = None
@@ -1375,12 +2011,39 @@ class IncognitoEngine:
                     burn_receipt = rec
                     break
 
+            # Native-input media: the burn receipt records the store-relative refs it confirmed
+            # removed. Any still on disk is a residual trace (the transcript scrub alone leaves it).
+            media_files_found = 0
+            if burn_receipt:
+                native_root = self.home_dir / "cache" / "documents" / "native-inputs"
+                for ref in burn_receipt.get("media_purged", []) or []:
+                    sha, sep, name = str(ref).partition("/")
+                    if not sep or not sha or not name or "/" in name or "\\" in name:
+                        continue
+                    if (native_root / sha / name).exists():
+                        media_files_found += 1
+
+            # Composer-cache attachments: the receipt records the file paths it confirmed
+            # removed. Any still on disk is a residual trace (the transcript scrub alone
+            # leaves the renderer's composer caches untouched).
+            composer_files_found = 0
+            if burn_receipt:
+                for file_path in burn_receipt.get("composer_purged", []) or []:
+                    try:
+                        if Path(str(file_path)).exists():
+                            composer_files_found += 1
+                    except OSError:
+                        composer_files_found += 1
+
             zero_trace = (
                 db_rows_found == 0
                 and session_files_found == 0
                 and hook_files_found == 0
                 and ram_vault_entries == 0
                 and not active_lease
+                and retaindb_clean
+                and media_files_found == 0
+                and composer_files_found == 0
             )
 
             return {
@@ -1391,7 +2054,11 @@ class IncognitoEngine:
                 "session_files_found": session_files_found,
                 "hook_files_found": hook_files_found,
                 "ram_vault_entries": ram_vault_entries,
+                "media_files_found": media_files_found,
+                "composer_files_found": composer_files_found,
                 "active_lease": active_lease,
+                "retaindb_memories_found": retaindb_count,
+                "retaindb_status": retaindb_status,
                 "receipt_id": burn_receipt.get("receipt_id") if burn_receipt else None,
                 "burn_receipt": burn_receipt,
             }
@@ -1756,7 +2423,7 @@ class IncognitoEngine:
                 state_db = self.home_dir / "state.db"
                 if SessionDB is None or not state_db.exists():
                     return False
-                db = SessionDB(db_path=state_db)
+                db = _open_session_db(state_db)
                 try:
                     marker = db.get_session_model_config_value(session_id, "incognito")
                 finally:

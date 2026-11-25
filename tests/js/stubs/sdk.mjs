@@ -1,6 +1,7 @@
 // Minimal @hermes/plugin-sdk stand-in for logic tests. Only the named imports plugin.js
 // uses are provided; optional UI kit pieces are absent, like on an older Desktop build.
 export const toasts = []
+export const logLines = []
 let focused = ''
 export function setFocused(sid) {
   focused = sid
@@ -9,6 +10,7 @@ export const drafts = {}
 export const host = {
   state: { focusedSessionId: { get: () => focused } },
   notify: t => toasts.push(t),
+  logs: async (...args) => logLines.push(args),
   navigate: () => {},
   composer: { getDraft: sid => drafts[sid ?? ''] ?? null }
 }
