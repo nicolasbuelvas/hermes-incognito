@@ -5,7 +5,7 @@ import pytest
 from pathlib import Path
 
 # Setup paths. The suite never adds a local Hermes install to sys.path: tests must not pick up
-# a real SessionDB, config, or plugin storage from ~/.hermes, so results stay deterministic.
+# a real StateStore, config, or plugin storage from ~/.hermes, so results stay deterministic.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -14,8 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
 _ENGINE_MODULES = ("engine", "hermes_plugin_incognito_test.engine")
 
 
-class MockSessionDB:
-    """Mock SessionDB fallback if hermes_state is not available."""
+class MockStateStore:
+    """Mock StateStore fallback if hermes_state is not available."""
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._init_db()
@@ -117,13 +117,13 @@ def isolated_hermes_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     # Even if hermes_state / hermes_cli happen to be importable, use isolated fallbacks.
-    # Tests that need a database opt in with monkeypatch.setattr(engine, "SessionDB", MockSessionDB).
+    # Tests that need a database opt in with monkeypatch.setattr(engine, "StateStore", MockStateStore).
     import engine as _engine  # noqa: F401  (ensure the top-level module is loaded)
     for name in _ENGINE_MODULES:
         mod = sys.modules.get(name)
         if mod is None:
             continue
-        monkeypatch.setattr(mod, "SessionDB", None, raising=False)
+        monkeypatch.setattr(mod, "StateStore", None, raising=False)
         monkeypatch.setattr(mod, "plugin_data_dir", None, raising=False)
         monkeypatch.setattr(mod, "load_config_readonly", lambda: {}, raising=False)
 
@@ -137,7 +137,7 @@ def isolated_hermes_env(tmp_path, monkeypatch):
 
     # Initialize a mock state.db in isolated HERMES_HOME
     db_path = tmp_path / "state.db"
-    mock_db = MockSessionDB(db_path)
+    mock_db = MockStateStore(db_path)
 
     # Reset engine if engine module is importable
     try:

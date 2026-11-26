@@ -1,8 +1,8 @@
 name: incognito
-version: "1.0.1"
+version: "1.1.0"
 manifest_version: 2
 api_version: 1
-requires_hermes: ">=0.22.0"
+requires_hermes: ">=0.23.0"
 author: Nicolas Buelvas
 license: MIT
 homepage: https://github.com/nicolasbuelvas/hermes-incognito

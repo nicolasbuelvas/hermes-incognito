@@ -124,7 +124,7 @@ def register(ctx: Any) -> None:
         except IncognitoActivationError as exc:
             return {"action": "block", "message": f"Could not activate Incognito. {exc}"}
         except Exception as exc:
-            logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__)
+            logger.warning("Incognito could not mask this turn (%s); blocking it.", type(exc).__name__, exc_info=True)
             return {"action": "block", "message": MASKING_BLOCKED_MESSAGE}
         if engine.is_incognito(sid):
             engine.touch_session(sid)
@@ -157,7 +157,7 @@ def register(ctx: Any) -> None:
         try:
             masked = engine.mask_tool_result(sid, current)
         except Exception as exc:
-            logger.warning("Incognito could not mask a tool result (%s); withholding it.", type(exc).__name__)
+            logger.warning("Incognito could not mask a tool result (%s); withholding it.", type(exc).__name__, exc_info=True)
             return "[tool result withheld: Incognito couldn't mask personal details in it]"
         return masked if masked is not None else scrubbed
 
@@ -220,7 +220,7 @@ def register(ctx: Any) -> None:
         except Exception as exc:
             # Hermes would skip a raising middleware and send the request as-is; the execution
             # gate below re-masks and re-checks the payload, so this request still can't leak.
-            logger.warning("Incognito request middleware failed (%s).", type(exc).__name__)
+            logger.warning("Incognito request middleware failed (%s).", type(exc).__name__, exc_info=True)
             return None
 
     def on_llm_execution(
@@ -234,7 +234,7 @@ def register(ctx: Any) -> None:
         try:
             payload, problem = engine.guard_outbound(sid, request)
         except Exception as exc:
-            logger.warning("Incognito masking gate failed (%s); blocking the send.", type(exc).__name__)
+            logger.warning("Incognito masking gate failed (%s); blocking the send.", type(exc).__name__, exc_info=True)
             payload, problem = None, MASKING_BLOCKED_MESSAGE
         if problem:
             return _blocked_response(problem)
