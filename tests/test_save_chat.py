@@ -7,7 +7,7 @@ import multiprocessing
 import time
 
 import pytest
-from conftest import MockSessionDB
+from conftest import MockStateStore
 from hermes_sim import (
     SimCtx,
     SimHermes,
@@ -24,7 +24,7 @@ EMAIL = "save.canary.42@example.org"
 
 @pytest.fixture
 def db(isolated_hermes_env, monkeypatch):
-    monkeypatch.setattr(plugin_engine, "SessionDB", MockSessionDB)
+    monkeypatch.setattr(plugin_engine, "StateStore", MockStateStore)
     return isolated_hermes_env["mock_db"]
 
 
@@ -291,7 +291,7 @@ def test_history_write_failure_can_be_retried(eng, db, monkeypatch, operation):
         assert eng.save_session("tip")["ok"]
     action = eng.save_session if operation == "save" else eng.undo_save
     hidden_before = operation == "save"
-    original = MockSessionDB.set_session_hidden
+    original = MockStateStore.set_session_hidden
 
     def fail_once(instance, sid, hidden):
         if sid == "head" and hidden != hidden_before:
@@ -299,7 +299,7 @@ def test_history_write_failure_can_be_retried(eng, db, monkeypatch, operation):
         return original(instance, sid, hidden)
 
     with monkeypatch.context() as failure:
-        failure.setattr(MockSessionDB, "set_session_hidden", fail_once)
+        failure.setattr(MockStateStore, "set_session_hidden", fail_once)
         assert not action("tip")["ok"]
         assert eng.is_incognito("tip") is hidden_before
         assert (_hidden(db, "tip"), _hidden(db, "head")) == (hidden_before, hidden_before)
@@ -337,7 +337,7 @@ def test_subagents_started_during_undo_are_masked_and_restored(eng, db, isolated
 
 def test_undo_after_restart_survives_sweep_until_new_idle_deadline(db, isolated_hermes_env, clock, monkeypatch):
     home = isolated_hermes_env["home"]
-    monkeypatch.setattr(plugin_engine, "SessionDB", MockSessionDB)
+    monkeypatch.setattr(plugin_engine, "StateStore", MockStateStore)
     first = plugin_engine.IncognitoEngine(home)
     with monkeypatch.context() as previous:
         previous.setattr(plugin_engine.os, "getpid", lambda: 2000000001)
@@ -387,7 +387,7 @@ def test_enable_fails_if_existing_chat_cannot_be_hidden_and_armed_turn_can_retry
     messages = [{"role": "user", "content": EMAIL}]
 
     with monkeypatch.context() as failure:
-        failure.setattr(MockSessionDB, "set_session_hidden", lambda *args: False)
+        failure.setattr(MockStateStore, "set_session_hidden", lambda *args: False)
         assert not eng.enable_session("existing", "strict")["ok"]
         assert db.get_session_model_config_value("existing", "incognito") is None
         assert not eng.is_incognito("existing")

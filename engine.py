@@ -37,9 +37,12 @@ except ImportError:
         return Path.home() / ".hermes"
 
 try:
-    from hermes_state import SessionDB
+    from .state_store import StateStore
 except ImportError:
-    SessionDB = None  # type: ignore[assignment,misc]
+    try:
+        from state_store import StateStore
+    except ImportError:
+        StateStore = None  # type: ignore[assignment,misc]
 
 try:
     from hermes_cli.config import load_config_readonly
@@ -604,19 +607,19 @@ class IncognitoEngine:
     def _set_history_state(self, markers: dict[str, Any], *, commit: Callable[[], None] | None = None) -> bool:
         """Update visibility and the Incognito marker, restoring previous values on failure."""
         state_db = self.home_dir / "state.db"
-        if not state_db.exists() or (SessionDB is None and commit is not None):
+        if not state_db.exists() or (StateStore is None and commit is not None):
             try:
                 if commit is not None:
                     commit()
                 return True
             except OSError:
                 return False
-        if SessionDB is None:
+        if StateStore is None:
             return False
 
         previous = {}
         try:
-            db = SessionDB(db_path=state_db)
+            db = StateStore(db_path=state_db)
             try:
                 for sid in markers:
                     row = db.get_session(sid)
@@ -746,9 +749,9 @@ class IncognitoEngine:
                         if isinstance(lid, str) and lid:
                             protected.add(lid)
             state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
+            if StateStore is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = StateStore(db_path=state_db)
                     try:
                         for sid in db.session_ids_with_model_config_key("incognito"):
                             if isinstance(sid, str) and sid:
@@ -800,7 +803,7 @@ class IncognitoEngine:
     # -------------------------------------------------------------------------
 
     def ensure_hidden_in_db(self, session_id: str) -> None:
-        """Ensure an active incognito session stays hidden in SessionDB after turn writes."""
+        """Ensure an active incognito session stays hidden in StateStore after turn writes."""
         if not session_id:
             return
         with self._locked():
@@ -809,9 +812,9 @@ class IncognitoEngine:
             if not lease:
                 return
             state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
+            if StateStore is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = StateStore(db_path=state_db)
                     try:
                         db.set_session_hidden(session_id, True)
                         db.patch_session_model_config(session_id, {"incognito": lease})
@@ -901,11 +904,11 @@ class IncognitoEngine:
                 self._add_subagent_lease(leases, root_id, new_lease)
             self._write_leases(leases)
 
-            # Update SessionDB
+            # Update StateStore
             state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
+            if StateStore is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = StateStore(db_path=state_db)
                     try:
                         db.set_session_hidden(new_session_id, True)
                         db.patch_session_model_config(new_session_id, {"incognito": new_lease})
@@ -1056,10 +1059,10 @@ class IncognitoEngine:
             state_db = self.home_dir / "state.db"
             db = None
             try:
-                if SessionDB is not None and state_db.exists():
-                    db = SessionDB(db_path=state_db)
+                if StateStore is not None and state_db.exists():
+                    db = StateStore(db_path=state_db)
             except Exception as exc:
-                logger.debug("Cannot open SessionDB for incognito burn: %s", exc)
+                logger.debug("Cannot open StateStore for incognito burn: %s", exc)
 
             def _authorized(sid: str) -> bool:
                 if isinstance(leases.get(sid), dict):
@@ -1132,7 +1135,7 @@ class IncognitoEngine:
                                 delete_plan[sid] = delete_ids
                                 target_ids.update(delete_ids)
                         except Exception as exc:
-                            logger.debug("Cannot plan SessionDB deletion for %s: %s", sid, exc)
+                            logger.debug("Cannot plan StateStore deletion for %s: %s", sid, exc)
 
                 # Persist recovery before deleting a row that may hold the only incognito marker.
                 lineage = sorted(target_ids)
@@ -1157,7 +1160,7 @@ class IncognitoEngine:
                             ):
                                 db_deleted = True
                         except Exception as exc:
-                            logger.debug("SessionDB.delete_session deferred for %s: %s", sid, exc)
+                            logger.debug("StateStore.delete_session deferred for %s: %s", sid, exc)
             finally:
                 if db is not None:
                     db.close()
@@ -1278,9 +1281,9 @@ class IncognitoEngine:
 
             # Check DB for model_config incognito orphans
             state_db = self.home_dir / "state.db"
-            if SessionDB is not None and state_db.exists():
+            if StateStore is not None and state_db.exists():
                 try:
-                    db = SessionDB(db_path=state_db)
+                    db = StateStore(db_path=state_db)
                     try:
                         db_incognito_ids = db.session_ids_with_model_config_key("incognito")
                         saved_members = {
@@ -1754,9 +1757,9 @@ class IncognitoEngine:
             saved = self._saved_record(session_id)
             if not saved:
                 state_db = self.home_dir / "state.db"
-                if SessionDB is None or not state_db.exists():
+                if StateStore is None or not state_db.exists():
                     return False
-                db = SessionDB(db_path=state_db)
+                db = StateStore(db_path=state_db)
                 try:
                     marker = db.get_session_model_config_value(session_id, "incognito")
                 finally:
@@ -1926,7 +1929,7 @@ class IncognitoEngine:
         try:
             return self._transform_llm_request(session_id, request)
         except Exception as exc:
-            logger.warning("Incognito masking failed (%s); this request will not be sent.", type(exc).__name__)
+            logger.warning("Incognito masking failed (%s); this request will not be sent.", type(exc).__name__, exc_info=True)
             return {"request": {"model": request.get("model"), "messages": []},
                     "source": "incognito", "reason": "masking_failed"}
 

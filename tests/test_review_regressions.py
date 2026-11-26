@@ -148,7 +148,7 @@ def test_expired_head_sweep_burns_head_and_ancestors(isolated_hermes_env):
 
 
 def test_manual_burn_of_head_cleans_ancestors(isolated_hermes_env, monkeypatch):
-    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
+    monkeypatch.setattr(engine, "StateStore", type(isolated_hermes_env["mock_db"]))
     _db_rows(isolated_hermes_env, "grandparent", "parent", "child")
     eng = IncognitoEngine(home_dir=isolated_hermes_env["home"])
     eng.enable_session("grandparent", ttl_minutes=60)
@@ -168,7 +168,7 @@ def test_manual_burn_of_head_cleans_ancestors(isolated_hermes_env, monkeypatch):
 def test_burn_of_ancestor_never_deletes_live_head(isolated_hermes_env, monkeypatch):
     """Hermes deletes a whole compression conversation from any segment; fence the live head out."""
     mock_type = type(isolated_hermes_env["mock_db"])
-    monkeypatch.setattr(engine, "SessionDB", mock_type)
+    monkeypatch.setattr(engine, "StateStore", mock_type)
     monkeypatch.setattr(
         mock_type, "get_session_delete_targets",
         lambda db, sid: [sid] + (["child"] if sid == "parent" else []),
@@ -367,7 +367,7 @@ def test_single_bar_strip_keeps_unrelated_separators():
 
 
 def test_tests_never_use_a_real_sessiondb():
-    assert engine.SessionDB is None
+    assert engine.StateStore is None
     hermes_paths = [p for p in sys.path if "hermes-agent" in p.replace("\\", "/")]
     assert not hermes_paths
 

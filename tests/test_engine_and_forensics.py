@@ -162,7 +162,7 @@ def test_engine_burn_session_zero_fill_and_receipt(isolated_hermes_env, monkeypa
 
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
-    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
+    monkeypatch.setattr(engine, "StateStore", type(isolated_hermes_env["mock_db"]))
     if hasattr(eng, "config"):
         eng.config["zero_fill_files"] = True
 
@@ -300,8 +300,8 @@ def test_engine_concurrency(isolated_hermes_env):
 
 
 def test_engine_burn_busy_session_defers_until_sessiondb_can_delete(isolated_hermes_env, monkeypatch):
-    """A busy admission keeps the session and its messages until SessionDB can delete both."""
-    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
+    """A busy admission keeps the session and its messages until StateStore can delete both."""
+    monkeypatch.setattr(engine, "StateStore", type(isolated_hermes_env["mock_db"]))
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
     retries = []
@@ -332,7 +332,7 @@ def test_engine_burn_busy_session_defers_until_sessiondb_can_delete(isolated_her
     eng.enable_session(sess_id, mode="strict")
     burn_res = eng.burn_session(sess_id, reason="session_finalize")
 
-    # The failed SessionDB transaction leaves both rows intact.
+    # The failed StateStore transaction leaves both rows intact.
     with sqlite3.connect(str(db_path)) as conn:
         msg_count = conn.execute("SELECT count(*) FROM messages WHERE session_id = ?", (sess_id,)).fetchone()[0]
         sess_count = conn.execute("SELECT count(*) FROM sessions WHERE id = ?", (sess_id,)).fetchone()[0]
@@ -365,7 +365,7 @@ def test_engine_burn_busy_session_defers_until_sessiondb_can_delete(isolated_her
 
 def test_burn_requires_lease_or_database_marker(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     eng = IncognitoEngine()
     sid, public_sid = "private", "public"
     public_file = eng.home_dir / "sessions" / f"{public_sid}.jsonl"
@@ -385,7 +385,7 @@ def test_burn_requires_lease_or_database_marker(isolated_hermes_env, monkeypatch
 
 def test_burn_refuses_unmarked_cascade(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     monkeypatch.setattr(type(mock_db), "get_session_delete_targets", lambda db, sid: [sid, "public"])
     eng = IncognitoEngine()
     monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
@@ -404,7 +404,7 @@ def test_burn_refuses_unmarked_cascade(isolated_hermes_env, monkeypatch):
 
 def test_burn_deletes_delegate_subagent_children_of_incognito_session(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     eng = IncognitoEngine()
     monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
     with sqlite3.connect(mock_db.db_path) as conn:
@@ -460,7 +460,7 @@ def test_burn_uses_exact_file_ownership_and_rejects_symlinks(isolated_hermes_env
 
 def test_burn_leaves_rows_pending_when_sessiondb_is_unavailable(isolated_hermes_env, monkeypatch):
     eng = IncognitoEngine()
-    monkeypatch.setattr(engine, "SessionDB", None)
+    monkeypatch.setattr(engine, "StateStore", None)
     monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda *a, **kw: None)
     eng.enable_session("private")
     mock_db = isolated_hermes_env["mock_db"]
@@ -474,7 +474,7 @@ def test_burn_leaves_rows_pending_when_sessiondb_is_unavailable(isolated_hermes_
 
 def test_file_cleanup_failure_keeps_burn_pending_across_restart(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     eng = IncognitoEngine()
     retries = []
     monkeypatch.setattr(eng, "_schedule_deferred_burn", lambda sid, attempt: retries.append((sid, attempt)))
@@ -518,7 +518,7 @@ def test_file_cleanup_failure_keeps_burn_pending_across_restart(isolated_hermes_
 
 def test_burn_recovers_after_interruption_with_database_only_marker(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     eng = IncognitoEngine()
     sid = "interrupted-cleanup"
     transcript = isolated_hermes_env["sessions_dir"] / f"{sid}.jsonl"
@@ -547,7 +547,7 @@ def test_burn_recovers_after_interruption_with_database_only_marker(isolated_her
 
 def test_burn_preserves_artifacts_if_recovery_cannot_be_saved(isolated_hermes_env, monkeypatch):
     mock_db = isolated_hermes_env["mock_db"]
-    monkeypatch.setattr(engine, "SessionDB", type(mock_db))
+    monkeypatch.setattr(engine, "StateStore", type(mock_db))
     eng = IncognitoEngine()
     sid = "recovery-write-error"
     transcript = isolated_hermes_env["sessions_dir"] / f"{sid}.jsonl"
@@ -575,11 +575,11 @@ def test_burn_session_refuses_non_incognito_and_unsafe_session_ids(isolated_herm
       1) Refuse any session_id that has neither an incognito lease nor model_config.incognito tag,
          leaving non-incognito DB rows and transcript files completely untouched.
       2) Refuse unsafe session_ids containing '/', '\\', '..', or absolute paths.
-      3) Allow burning an orphaned session tagged with model_config.incognito in SessionDB even
+      3) Allow burning an orphaned session tagged with model_config.incognito in StateStore even
          when leases.json has no entry for it.
     """
-    # Exercise the SessionDB marker path with the isolated mock (the suite defaults to no SessionDB).
-    monkeypatch.setattr(engine, "SessionDB", type(isolated_hermes_env["mock_db"]))
+    # Exercise the StateStore marker path with the isolated mock (the suite defaults to no StateStore).
+    monkeypatch.setattr(engine, "StateStore", type(isolated_hermes_env["mock_db"]))
     tmp_path = isolated_hermes_env["home"]
     eng = IncognitoEngine(home_dir=tmp_path)
     db_path = tmp_path / "state.db"
@@ -588,8 +588,8 @@ def test_burn_session_refuses_non_incognito_and_unsafe_session_ids(isolated_herm
     normal_sid = "sess-normal-untouched"
     normal_file = isolated_hermes_env["sessions_dir"] / f"{normal_sid}.jsonl"
     normal_file.write_text('{"role": "user", "content": "important permanent chat"}\n', encoding="utf-8")
-    if engine.SessionDB is not None:
-        real_db = engine.SessionDB(db_path=db_path)
+    if engine.StateStore is not None:
+        real_db = engine.StateStore(db_path=db_path)
         try:
             real_db.create_session(normal_sid, source="cli", model="gpt-4")
         finally:
@@ -610,12 +610,12 @@ def test_burn_session_refuses_non_incognito_and_unsafe_session_ids(isolated_herm
         res_bad = eng.burn_session(bad_id, reason="traversal_attempt")
         assert res_bad["ok"] is False
 
-    # 3. Session tagged via model_config.incognito in SessionDB (without lease in leases.json) CAN be burned
-    if engine.SessionDB is not None:
+    # 3. Session tagged via model_config.incognito in StateStore (without lease in leases.json) CAN be burned
+    if engine.StateStore is not None:
         tagged_sid = "sess-db-tagged-incog"
         tagged_file = isolated_hermes_env["sessions_dir"] / f"{tagged_sid}.jsonl"
         tagged_file.write_text('{"role": "user", "content": "orphaned incog"}\n', encoding="utf-8")
-        real_db = engine.SessionDB(db_path=db_path)
+        real_db = engine.StateStore(db_path=db_path)
         try:
             real_db.create_session(tagged_sid, source="cli", model="gpt-4")
             real_db.patch_session_model_config(tagged_sid, {"incognito": {"mode": "strict"}})
@@ -705,6 +705,6 @@ def test_burn_and_verify_confine_hook_outputs_and_use_exact_filenames(isolated_h
 
 
 def test_engine_never_issues_raw_sql_deletes():
-    """Ported from upstream: state.db rows are deleted only through SessionDB.delete_session()."""
+    """Ported from upstream: state.db rows are deleted only through StateStore.delete_session()."""
     engine_source = (PROJECT_ROOT / "engine.py").read_text(encoding="utf-8")
     assert "DELETE FROM" not in engine_source
